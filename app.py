@@ -15,7 +15,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 CH_API_KEY = os.getenv("CH_API_KEY", "").strip()
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -60,7 +60,7 @@ def ch_session() -> requests.Session:
     s.auth = (CH_API_KEY, "")
     s.headers.update({
         "Accept": "application/json",
-        "User-Agent": "rix-credit-api/2.0.2",
+        "User-Agent": "rix-credit-api/2.0.3",
     })
     return s
 
@@ -203,7 +203,6 @@ def looks_like_accounts_filing(item: Dict[str, Any]) -> bool:
 
 
 def get_latest_accounts(company_number: str) -> Optional[Dict[str, Any]]:
-    # Verify company exists and auth works
     _profile = ch_get(f"{CH_API_BASE}/company/{company_number}")
 
     filings = ch_get(
@@ -238,7 +237,10 @@ def run_extraction(pdf_bytes: bytes, company_number: str) -> Dict[str, Any]:
             result = extract_financials_from_pdf_bytes(pdf_bytes, company_number)
             q.put({"ok": True, "result": result})
         except Exception as e:
-            q.put({"ok": False, "error": str(e)})
+            q.put({
+                "ok": False,
+                "error": str(e),
+            })
 
     q = mp.Queue()
     p = mp.Process(target=worker, args=(q,))
@@ -248,17 +250,29 @@ def run_extraction(pdf_bytes: bytes, company_number: str) -> Dict[str, Any]:
     if p.is_alive():
         p.terminate()
         p.join(2)
-        raise HTTPException(504, "Extraction timeout")
+        return {
+            "status": "timeout",
+            "message": f"Extraction exceeded {EXTRACTION_TIMEOUT}s",
+        }
 
     if q.empty():
-        raise HTTPException(502, "Extraction failed with no result")
+        return {
+            "status": "error",
+            "message": "Extraction returned no result",
+        }
 
     payload = q.get()
 
     if not payload.get("ok"):
-        raise HTTPException(422, payload.get("error", "Extraction failed"))
+        return {
+            "status": "failed",
+            "error": payload.get("error", "Unknown extraction error"),
+        }
 
-    return payload["result"]
+    return {
+        "status": "success",
+        "data": payload["result"],
+    }
 
 
 @app.get("/rix-credit/company/{company_number}")
@@ -313,6 +327,6 @@ def latest_accounts_financials(company_number: str):
 
     return {
         "company_number": company_number,
-        "status": "ok",
+        "status": result.get("status", "unknown"),
         "financials": result,
     }
