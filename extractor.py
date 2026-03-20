@@ -1,17 +1,11 @@
 import io
 import re
-import math
-import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import pdfplumber
-import pytesseract
-from pdf2image import convert_from_bytes
 
 
-MIN_DIRECT_TEXT_CHARS = 800
-MAX_OCR_PAGES = 12
-OCR_DPI = 200
+MIN_TEXT_LENGTH = 100
 
 
 FIELD_ALIASES = {
@@ -30,7 +24,6 @@ FIELD_ALIASES = {
         "cash at bank",
         "cash in hand",
         "cash",
-        "bank",
     ],
     "debtors": [
         "debtors",
@@ -76,7 +69,7 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def pdfplumber_extract_text(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+def extract_text_from_pdf(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
     pages_text: List[str] = []
     page_count = 0
 
@@ -88,53 +81,12 @@ def pdfplumber_extract_text(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                 pages_text.append(txt)
 
     text = normalize_text("\n\n".join(pages_text))
-    stats = {
+    meta = {
         "method": "pdfplumber",
         "page_count": page_count,
         "text_chars": len(text),
     }
-    return text, stats
-
-
-def ocr_extract_text(pdf_bytes: bytes, max_pages: int = MAX_OCR_PAGES, dpi: int = OCR_DPI) -> Tuple[str, Dict[str, Any]]:
-    images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=max_pages)
-    page_texts: List[str] = []
-
-    for image in images:
-        txt = pytesseract.image_to_string(image, config="--oem 1 --psm 6")
-        if txt.strip():
-            page_texts.append(txt)
-
-    text = normalize_text("\n\n".join(page_texts))
-    stats = {
-        "method": "ocr",
-        "ocr_pages": len(images),
-        "text_chars": len(text),
-        "dpi": dpi,
-    }
-    return text, stats
-
-
-def choose_extraction(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    direct_text, direct_stats = pdfplumber_extract_text(pdf_bytes)
-
-    # Prefer native text when it looks usable.
-    if len(direct_text) >= MIN_DIRECT_TEXT_CHARS:
-        return direct_text, {
-            "primary_method": "pdfplumber",
-            "fallback_used": False,
-            "pdfplumber": direct_stats,
-        }
-
-    ocr_text, ocr_stats = ocr_extract_text(pdf_bytes)
-    combined_text = direct_text if len(direct_text) >= len(ocr_text) else ocr_text
-
-    return combined_text, {
-        "primary_method": "ocr" if len(ocr_text) > len(direct_text) else "pdfplumber",
-        "fallback_used": True,
-        "pdfplumber": direct_stats,
-        "ocr": ocr_stats,
-    }
+    return text, meta
 
 
 def split_lines(text: str) -> List[str]:
@@ -144,7 +96,6 @@ def split_lines(text: str) -> List[str]:
 
 def parse_number(token: str) -> Optional[int]:
     token = token.strip()
-
     if not token:
         return None
 
@@ -161,26 +112,18 @@ def parse_number(token: str) -> Optional[int]:
     if not re.fullmatch(r"-?\d+(?:\.\d+)?", token):
         return None
 
-    try:
-        value = float(token)
-    except ValueError:
-        return None
-
+    value = float(token)
     if negative:
         value = -value
 
-    if math.isfinite(value):
-        return int(round(value))
-    return None
+    return int(round(value))
 
 
 def extract_numeric_tokens(line: str) -> List[int]:
-    # Pull bracketed negatives and plain numbers.
     raw_tokens = re.findall(r"\(\d[\d,]*\)|-?\d[\d,]*(?:\.\d+)?", line)
     values = [parse_number(tok) for tok in raw_tokens]
     values = [v for v in values if v is not None]
 
-    # Remove obvious note-reference numbers if we have 3+ values and the first is tiny.
     if len(values) >= 3 and abs(values[0]) <= 99 and abs(values[1]) >= 100:
         values = values[1:]
 
@@ -192,10 +135,10 @@ def extract_numeric_tokens(line: str) -> List[int]:
 
 def extract_year_headers(text: str) -> List[int]:
     years = re.findall(r"\b(20\d{2}|19\d{2})\b", text)
-    years_int = []
+    years_int: List[int] = []
     for y in years:
         yi = int(y)
-        if 1900 <= yi <= 2100 and yi not in years_int:
+        if yi not in years_int:
             years_int.append(yi)
     years_int.sort(reverse=True)
     return years_int[:3]
@@ -221,10 +164,9 @@ def find_best_line_for_aliases(lines: List[str], aliases: List[str]) -> Optional
     return candidates[0][1]
 
 
-def values_to_series(values: List[int], years: List[int]) -> Dict[str, Optional[int]]:
-    if not values:
+def values_to_series(values: List[int]) -> Dict[str, Optional[int]]:
+    if len(values) == 0:
         return {"latest": None, "previous": None, "previous_2": None}
-
     if len(values) == 1:
         return {"latest": values[0], "previous": None, "previous_2": None}
     if len(values) == 2:
@@ -232,7 +174,7 @@ def values_to_series(values: List[int], years: List[int]) -> Dict[str, Optional[
     return {"latest": values[0], "previous": values[1], "previous_2": values[2]}
 
 
-def line_to_field_payload(line: Optional[str], years: List[int]) -> Dict[str, Any]:
+def line_to_field_payload(line: Optional[str]) -> Dict[str, Any]:
     if not line:
         return {
             "line": None,
@@ -242,7 +184,7 @@ def line_to_field_payload(line: Optional[str], years: List[int]) -> Dict[str, An
     values = extract_numeric_tokens(line)
     return {
         "line": line,
-        "values": values_to_series(values, years),
+        "values": values_to_series(values),
     }
 
 
@@ -282,7 +224,7 @@ def parse_financial_fields(text: str) -> Dict[str, Any]:
     raw = {}
     for field_name, aliases in FIELD_ALIASES.items():
         line = find_best_line_for_aliases(lines, aliases)
-        raw[field_name] = line_to_field_payload(line, years)
+        raw[field_name] = line_to_field_payload(line)
 
     fixed_assets = raw["fixed_assets"]["values"]
     current_assets = raw["current_assets"]["values"]
@@ -290,15 +232,14 @@ def parse_financial_fields(text: str) -> Dict[str, Any]:
     debtors = raw["debtors"]["values"]
     current_liabilities = raw["current_liabilities"]["values"]
     long_term_liabilities = raw["long_term_liabilities"]["values"]
-    working_capital_explicit = raw["working_capital"]["values"]
-    net_assets_explicit = raw["net_assets"]["values"]
+    working_capital = raw["working_capital"]["values"]
+    net_assets = raw["net_assets"]["values"]
 
-    working_capital = working_capital_explicit
     if not any(v is not None for v in working_capital.values()):
         working_capital = derive_working_capital(current_assets, current_liabilities)
 
     net_assets = derive_net_assets(
-        net_assets_field=net_assets_explicit,
+        net_assets_field=net_assets,
         working_capital=working_capital,
         fixed_assets=fixed_assets,
         long_term_liabilities=long_term_liabilities,
@@ -328,11 +269,12 @@ def score_extraction(fields: Dict[str, Any]) -> Dict[str, Any]:
         if any(v is not None for v in field_values.values()):
             populated += 1
 
-    confidence = "low"
     if populated >= 5:
         confidence = "high"
     elif populated >= 3:
         confidence = "medium"
+    else:
+        confidence = "low"
 
     return {
         "populated_fields": populated,
@@ -342,8 +284,9 @@ def score_extraction(fields: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: Optional[str] = None) -> Dict[str, Any]:
-    text, extraction_meta = choose_extraction(pdf_bytes)
-    if not text or len(text) < 150:
+    text, extraction_meta = extract_text_from_pdf(pdf_bytes)
+
+    if len(text) < MIN_TEXT_LENGTH:
         raise ValueError("Insufficient text extracted from PDF")
 
     parsed = parse_financial_fields(text)
