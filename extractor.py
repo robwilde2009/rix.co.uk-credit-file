@@ -204,9 +204,28 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     candidates: List[Tuple[int, str]] = []
 
-    for line in lines:
+    section_lines = lines
+
+    if any("current assets" in p for p in patterns):
+        start_idx = None
+        end_idx = None
+
+        for i, line in enumerate(lines):
+            l = line.lower()
+            if "current assets" in l and start_idx is None:
+                start_idx = i
+                continue
+            if start_idx is not None and "current liabilities" in l:
+                end_idx = i
+                break
+
+        if start_idx is not None:
+            section_lines = lines[start_idx:end_idx] if end_idx is not None else lines[start_idx:]
+
+    for line in section_lines:
         line_l = line.lower()
-        if not line_matches_any(line, patterns):
+
+        if not any(p in line_l for p in patterns):
             continue
 
         score = 10
