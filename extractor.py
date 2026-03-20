@@ -9,7 +9,7 @@ import pytesseract
 
 MIN_TEXT_LENGTH = 100
 OCR_FIRST_PAGE = 4
-OCR_LAST_PAGE = 5
+OCR_LAST_PAGE = 10
 OCR_DPI = 120
 DEBUG_SNIPPET_LENGTH = 2000
 
@@ -206,6 +206,7 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
 
     section_lines = lines
 
+    # Section-aware handling for current assets
     if any("current assets" in p for p in patterns):
         start_idx = None
         end_idx = None
@@ -224,6 +225,11 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
 
     for line in section_lines:
         line_l = line.lower()
+
+        # Critical fix: stop non-current lines contaminating current-assets matching
+        if any("current assets" in p for p in patterns):
+            if "non-current" in line_l or "non current" in line_l:
+                continue
 
         if not any(p in line_l for p in patterns):
             continue
