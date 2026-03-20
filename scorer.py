@@ -105,9 +105,11 @@ def detect_data_quality_warnings(
         accounts_type = (((profile.get("accounts") or {}).get("last_accounts") or {}).get("type"))
 
     has_outstanding_charges = False
+    outstanding_charge_count = 0
     if charges:
         items = charges.get("items", []) or []
-        has_outstanding_charges = any((item.get("status") or "").lower() == "outstanding" for item in items)
+        outstanding_charge_count = sum(1 for item in items if (item.get("status") or "").lower() == "outstanding")
+        has_outstanding_charges = outstanding_charge_count > 0
 
     current_assets_inferred_from_total_assets = (
         current_assets is not None
@@ -146,6 +148,7 @@ def detect_data_quality_warnings(
         "adjustments": adjustments,
         "current_assets_inferred_from_total_assets": current_assets_inferred_from_total_assets,
         "has_outstanding_charges": has_outstanding_charges,
+        "outstanding_charge_count": outstanding_charge_count,
         "accounts_type": accounts_type,
         "method": method,
         "extraction_confidence": extraction_confidence,
@@ -172,7 +175,6 @@ def score_financials(
     quality = detect_data_quality_warnings(financials, profile=profile, charges=charges)
 
     current_assets_for_ratio = current_assets
-    # If current assets are inferred from total assets, do not trust them for a strong liquidity ratio.
     if quality["current_assets_inferred_from_total_assets"]:
         current_assets_for_ratio = None
 
@@ -188,80 +190,82 @@ def score_financials(
     score = 50
     notes: List[str] = []
 
-    # Liquidity
-    if current_ratio is not None:
-        if current_ratio >= 2.0:
-            score += 15
-            notes.append("Strong current ratio")
-        elif current_ratio >= 1.5:
-            score += 10
-            notes.append("Good current ratio")
-        elif current_ratio >= 1.2:
-            score += 5
-            notes.append("Adequate current ratio")
-        elif current_ratio >= 1.0:
-            score += 0
-            notes.append("Tight but acceptable current ratio")
-        elif current_ratio >= 0.8:
-            score -= 10
-            notes.append("Weak current ratio")
-        else:
-            score -= 20
-            notes.append("Poor current ratio")
-    else:
-        notes.append("Current ratio not relied upon due to extraction limitations")
-
-    # Working capital
-    if working_capital is not None and not quality["current_assets_inferred_from_total_assets"]:
-        if working_capital > 0:
-            score += 10
-            notes.append("Positive working capital")
-        else:
-            score -= 15
-            notes.append("Negative working capital")
-    elif working_capital is not None and quality["current_assets_inferred_from_total_assets"]:
-        notes.append("Working capital treated cautiously because current assets are inferred")
-
-    # Net assets
+    # Core financial strength
     if net_assets is not None:
         if net_assets > 0:
-            score += 10
+            score += 14
             notes.append("Positive net assets")
         else:
-            score -= 25
+            score -= 22
             notes.append("Negative net assets")
 
-    # Leverage
     if liabilities_to_net_assets is not None:
-        if liabilities_to_net_assets < 1.0:
+        if liabilities_to_net_assets < 0.5:
+            score += 14
+            notes.append("Very low liabilities relative to net assets")
+        elif liabilities_to_net_assets < 1.0:
             score += 10
             notes.append("Low liabilities relative to net assets")
         elif liabilities_to_net_assets < 2.0:
             score += 4
             notes.append("Manageable liabilities relative to net assets")
         elif liabilities_to_net_assets < 3.0:
-            score -= 4
+            score -= 3
             notes.append("Elevated liabilities relative to net assets")
         else:
-            score -= 12
+            score -= 10
             notes.append("High liabilities relative to net assets")
 
-    # Cash support
     if cash_ratio is not None:
         if cash_ratio >= 0.5:
-            score += 8
+            score += 6
             notes.append("Strong cash cover")
         elif cash_ratio >= 0.25:
             score += 3
             notes.append("Moderate cash cover")
-        elif cash_ratio < 0.1:
-            score -= 8
+        elif cash_ratio >= 0.15:
+            score += 0
+            notes.append("Tight cash cover")
+        else:
+            score -= 3
             notes.append("Weak cash cover")
 
-    # Asset quality proxy
+    if current_ratio is not None:
+        if current_ratio >= 2.0:
+            score += 10
+            notes.append("Strong current ratio")
+        elif current_ratio >= 1.5:
+            score += 7
+            notes.append("Good current ratio")
+        elif current_ratio >= 1.2:
+            score += 4
+            notes.append("Adequate current ratio")
+        elif current_ratio >= 1.0:
+            score += 0
+            notes.append("Tight but acceptable current ratio")
+        elif current_ratio >= 0.8:
+            score -= 8
+            notes.append("Weak current ratio")
+        else:
+            score -= 15
+            notes.append("Poor current ratio")
+    else:
+        notes.append("Current ratio not relied upon due to extraction limitations")
+
+    if working_capital is not None:
+        if quality["current_assets_inferred_from_total_assets"]:
+            notes.append("Working capital treated cautiously because current assets are inferred")
+        else:
+            if working_capital > 0:
+                score += 6
+                notes.append("Positive working capital")
+            else:
+                score -= 12
+                notes.append("Negative working capital")
+
     if debtors_to_current_assets is not None:
         if debtors_to_current_assets > 0.7:
-            score -= 6
+            score -= 4
             notes.append("Current assets concentrated in receivables")
         elif debtors_to_current_assets < 0.35:
             score += 2
@@ -287,55 +291,59 @@ def score_financials(
         score -= 10
         notes.append("Limited financial data available")
     elif populated < 7:
-        score -= 5
+        score -= 4
         notes.append("Only partial balance-sheet coverage available")
 
-    # Data quality penalties
+    # Light-touch quality penalties
     if quality["method"] == "ocr":
-        score -= 4
+        score -= 2
         notes.append("OCR-derived extraction introduces additional uncertainty")
 
     if quality["extraction_confidence"] == "medium":
-        score -= 6
+        score -= 3
         notes.append("Moderate extraction confidence")
     elif quality["extraction_confidence"] == "low":
-        score -= 12
+        score -= 8
         notes.append("Low extraction confidence")
 
     if quality["current_assets_inferred_from_total_assets"]:
-        score -= 12
+        score -= 4
         notes.append("Liquidity metrics softened because current assets are inferred from total assets")
 
     if non_current_assets is None and fixed_assets is None:
-        score -= 6
+        score -= 3
         notes.append("Non-current asset extraction incomplete")
 
     if quality["has_outstanding_charges"]:
-        score -= 6
-        notes.append("Outstanding charges increase structural risk")
+        if liabilities_to_net_assets is not None and liabilities_to_net_assets < 1.0:
+            score -= 2
+            notes.append("Outstanding charges noted, but balance-sheet leverage appears modest")
+        else:
+            score -= 4
+            notes.append("Outstanding charges increase structural risk")
 
-    # Score caps
+    # Conservative caps
     score_cap = 100
     cap_reasons: List[str] = []
 
     if quality["accounts_type"] == "interim":
-        score_cap = min(score_cap, 82)
+        score_cap = min(score_cap, 78)
         cap_reasons.append("Interim accounts cap the maximum score")
 
     if quality["method"] == "ocr":
-        score_cap = min(score_cap, 80)
+        score_cap = min(score_cap, 76)
         cap_reasons.append("OCR-derived accounts cap the maximum score")
 
     if quality["current_assets_inferred_from_total_assets"]:
-        score_cap = min(score_cap, 72)
+        score_cap = min(score_cap, 70)
         cap_reasons.append("Inferred current assets cap the maximum score")
 
     if non_current_assets is None and fixed_assets is None:
-        score_cap = min(score_cap, 72)
+        score_cap = min(score_cap, 70)
         cap_reasons.append("Missing non-current / fixed asset extraction caps the maximum score")
 
     if quality["has_outstanding_charges"]:
-        score_cap = min(score_cap, 75)
+        score_cap = min(score_cap, 72)
         cap_reasons.append("Outstanding charges cap the maximum score")
 
     score = max(0, min(100, int(round(score))))
