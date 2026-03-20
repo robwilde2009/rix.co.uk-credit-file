@@ -134,7 +134,11 @@ def latest_accounts_financials(company_number: str):
         pdf = doc_pdf(data["pdf_url"])
 
         try:
-            extracted = extract_financials_from_pdf_bytes(pdf, company_number)
+            return {
+    "status": "debug",
+    "company_number": company_number,
+    "pdf_size": len(pdf),
+}
 
             return {
                 "status": "success",
