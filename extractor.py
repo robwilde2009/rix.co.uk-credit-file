@@ -8,10 +8,10 @@ import pytesseract
 
 
 MIN_TEXT_LENGTH = 100
-OCR_FIRST_PAGE = 3
-OCR_LAST_PAGE = 6
-OCR_DPI = 150
-DEBUG_SNIPPET_LENGTH = 2500
+OCR_FIRST_PAGE = 4
+OCR_LAST_PAGE = 5
+OCR_DPI = 120
+DEBUG_SNIPPET_LENGTH = 2000
 
 FIELD_KEYWORDS = {
     "fixed_assets": ["fixed assets", "tangible assets", "intangible assets"],
@@ -45,7 +45,6 @@ PAGE_SIGNALS = [
     "creditors",
     "net assets",
     "called up share capital",
-    "profit and loss account",
     "capital and reserves",
     "shareholders' funds",
     "shareholders funds",
@@ -71,6 +70,7 @@ def extract_text_ocr_pages(pdf_bytes: bytes) -> List[str]:
             first_page=OCR_FIRST_PAGE,
             last_page=OCR_LAST_PAGE,
             dpi=OCR_DPI,
+            grayscale=True,
         )
     except Exception:
         return []
@@ -78,40 +78,32 @@ def extract_text_ocr_pages(pdf_bytes: bytes) -> List[str]:
     pages: List[str] = []
     for img in images:
         try:
-            txt = pytesseract.image_to_string(img)
+            txt = pytesseract.image_to_string(img, config="--oem 1 --psm 6")
             pages.append(txt.strip())
         except Exception:
             pages.append("")
-
     return pages
 
 
 def score_page(text: str) -> int:
     t = text.lower()
     score = 0
-
     for signal in PAGE_SIGNALS:
         if signal in t:
             score += 3
-
     if re.search(r"\b20\d{2}\b", t):
         score += 1
-
     if len(re.findall(r"\(?\d[\d,]*\)?", text)) >= 5:
         score += 2
-
     return score
 
 
-def pick_best_pages(pages: List[str], top_n: int = 3) -> List[Tuple[int, str]]:
+def pick_best_pages(pages: List[str], top_n: int = 2) -> List[Tuple[int, str]]:
     scored: List[Tuple[int, int, str]] = []
-
     for i, page in enumerate(pages):
         scored.append((i, score_page(page), page))
-
     scored.sort(key=lambda x: x[1], reverse=True)
-    best = [(i, page) for i, s, page in scored if s > 0][:top_n]
-    return best
+    return [(i, page) for i, s, page in scored if s > 0][:top_n]
 
 
 def parse_number(text: str) -> Optional[int]:
@@ -135,29 +127,25 @@ def extract_line_value(line: str) -> Optional[int]:
     numbers = re.findall(r"\(\d[\d,]*\)|-?\d[\d,]*", line)
     if not numbers:
         return None
-
     for token in reversed(numbers):
         val = parse_number(token)
         if val is not None:
             return val
-
     return None
 
 
 def find_value(text: str, keywords: List[str]) -> Optional[int]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-
     for line in lines:
         line_l = line.lower()
         if any(k in line_l for k in keywords):
             val = extract_line_value(line)
             if val is not None:
                 return val
-
     return None
 
 
-def extract_financials_from_text(
+def build_result(
     text: str,
     company_number: Optional[str],
     method: str,
@@ -175,20 +163,19 @@ def extract_financials_from_text(
     if current_assets is not None and current_liabilities is not None:
         working_capital = current_assets - current_liabilities
 
-    debug_sample_parts: List[str] = []
     debug_page_numbers: List[int] = []
+    debug_parts: List[str] = []
 
     for idx, page_text in debug_pages:
         page_num = idx + 1 + page_number_offset
         debug_page_numbers.append(page_num)
-        snippet = page_text[:800]
-        debug_sample_parts.append(f"[PAGE {page_num}]\n{snippet}")
+        debug_parts.append(f"[PAGE {page_num}]\n{page_text[:700]}")
 
     return {
         "company_number": company_number,
         "method": method,
         "debug_page_numbers": debug_page_numbers,
-        "debug_text_sample": "\n\n".join(debug_sample_parts)[:DEBUG_SNIPPET_LENGTH],
+        "debug_text_sample": "\n\n".join(debug_parts)[:DEBUG_SNIPPET_LENGTH],
         "fixed_assets": fixed_assets,
         "current_assets": current_assets,
         "cash": cash,
@@ -205,21 +192,14 @@ def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = No
 
     if len(pdf_full_text) >= MIN_TEXT_LENGTH:
         best_pages = pick_best_pages(pdf_pages)
-        if best_pages:
-            text = "\n\n".join(page for _, page in best_pages)
-            debug_pages = best_pages
-        else:
-            text = pdf_full_text
-            debug_pages = [(0, pdf_full_text[:800])]
-
-        result = extract_financials_from_text(
+        text = "\n\n".join(page for _, page in best_pages) if best_pages else pdf_full_text
+        result = build_result(
             text=text,
             company_number=company_number,
             method="pdfplumber",
-            debug_pages=debug_pages,
+            debug_pages=best_pages if best_pages else [(0, pdf_full_text[:700])],
             page_number_offset=0,
         )
-
         if any(
             result[field] is not None
             for field in [
@@ -240,17 +220,12 @@ def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = No
         raise ValueError("No readable text found (PDF + OCR failed)")
 
     best_pages = pick_best_pages(ocr_pages)
-    if best_pages:
-        text = "\n\n".join(page for _, page in best_pages)
-        debug_pages = best_pages
-    else:
-        text = ocr_full_text
-        debug_pages = [(0, ocr_full_text[:800])]
+    text = "\n\n".join(page for _, page in best_pages) if best_pages else ocr_full_text
 
-    return extract_financials_from_text(
+    return build_result(
         text=text,
         company_number=company_number,
         method="ocr",
-        debug_pages=debug_pages,
+        debug_pages=best_pages if best_pages else [(0, ocr_full_text[:700])],
         page_number_offset=OCR_FIRST_PAGE - 1,
     )
