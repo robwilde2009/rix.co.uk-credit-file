@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+gunicorn
+requests
+pdfplumber
+pdf2image
+pytesseract
+pydantic
