@@ -13,7 +13,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 CH_API_KEY = os.getenv("CH_API_KEY", "").strip()
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -49,35 +49,48 @@ def healthz():
 def ch_session():
     s = requests.Session()
     s.auth = (CH_API_KEY, "")
+    s.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "rix-credit-api/2.1.1",
+    })
     return s
 
 
 def ch_get(url: str, params=None):
+    if not CH_API_KEY:
+        raise HTTPException(500, "CH_API_KEY is missing")
+
     with ch_session() as s:
         r = s.get(url, params=params, timeout=HTTP_TIMEOUT)
 
     if not r.ok:
-        raise HTTPException(502, f"CH API error: {r.status_code} {r.text[:200]}")
+        raise HTTPException(502, f"CH API error: {r.status_code} {r.text[:300]}")
 
     return r.json()
 
 
 def doc_get(url: str):
+    if not CH_API_KEY:
+        raise HTTPException(500, "CH_API_KEY is missing")
+
     with ch_session() as s:
         r = s.get(url, timeout=HTTP_TIMEOUT)
 
     if not r.ok:
-        raise HTTPException(502, f"Document API error: {r.status_code}")
+        raise HTTPException(502, f"Document API error: {r.status_code} {r.text[:300]}")
 
     return r.json()
 
 
 def doc_pdf(url: str) -> bytes:
+    if not CH_API_KEY:
+        raise HTTPException(500, "CH_API_KEY is missing")
+
     with ch_session() as s:
-        r = s.get(url, timeout=PDF_TIMEOUT)
+        r = s.get(url, timeout=PDF_TIMEOUT, headers={"Accept": "application/pdf"})
 
     if not r.ok:
-        raise HTTPException(502, "PDF fetch failed")
+        raise HTTPException(502, f"PDF fetch failed: {r.status_code}")
 
     return r.content
 
@@ -86,21 +99,41 @@ def normalize_doc_url(link: Optional[str]) -> Optional[str]:
     if not link:
         return None
 
-    if link.startswith("http"):
+    link = link.strip()
+
+    if link.startswith("http://") or link.startswith("https://"):
         return link
+
+    if link.startswith("/"):
+        return f"{CH_DOC_BASE}{link}"
 
     return f"{CH_DOC_BASE}/{link.lstrip('/')}"
 
 
 def looks_like_accounts_filing(item):
-    text = str(item).lower()
-    return "accounts" in text
+    text = " ".join([
+        str(item.get("category", "")),
+        str(item.get("description", "")),
+        str(item.get("type", "")),
+        str(item.get("description_values", "")),
+    ]).lower()
+
+    markers = [
+        "accounts",
+        "annual accounts",
+        "interim",
+        "micro-entity",
+        "filleted accounts",
+        "dormant",
+        "unaudited",
+    ]
+    return any(m in text for m in markers)
 
 
 def get_latest_accounts(company_number: str):
     filings = ch_get(
         f"{CH_API_BASE}/company/{company_number}/filing-history",
-        params={"items_per_page": 50},
+        params={"items_per_page": 100},
     )
 
     for item in filings.get("items", []):
@@ -113,7 +146,7 @@ def get_latest_accounts(company_number: str):
             continue
 
         metadata = doc_get(meta_url)
-        pdf_url = meta_url + "/content"
+        pdf_url = meta_url.rstrip("/") + "/content"
 
         return {
             "filing": item,
@@ -124,6 +157,39 @@ def get_latest_accounts(company_number: str):
     return None
 
 
+@app.get("/rix-credit/company/{company_number}")
+def company_bundle(company_number: str):
+    return {
+        "company_profile": ch_get(f"{CH_API_BASE}/company/{company_number}"),
+        "officers": ch_get(f"{CH_API_BASE}/company/{company_number}/officers"),
+        "pscs": ch_get(f"{CH_API_BASE}/company/{company_number}/persons-with-significant-control"),
+        "charges": ch_get(f"{CH_API_BASE}/company/{company_number}/charges"),
+    }
+
+
+@app.get("/rix-credit/company/{company_number}/latest-accounts-metadata")
+def latest_accounts_metadata(company_number: str):
+    data = get_latest_accounts(company_number)
+    if not data:
+        raise HTTPException(404, "No accounts found")
+    return data
+
+
+@app.get("/rix-credit/company/{company_number}/latest-accounts.pdf")
+def latest_accounts_pdf(company_number: str):
+    data = get_latest_accounts(company_number)
+    if not data:
+        raise HTTPException(404, "No accounts PDF")
+
+    pdf = doc_pdf(data["pdf_url"])
+
+    return StreamingResponse(
+        io.BytesIO(pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=accounts.pdf"},
+    )
+
+
 @app.get("/rix-credit/company/{company_number}/latest-accounts-financials")
 def latest_accounts_financials(company_number: str):
     try:
@@ -132,33 +198,21 @@ def latest_accounts_financials(company_number: str):
             return {"status": "no_accounts"}
 
         pdf = doc_pdf(data["pdf_url"])
+        extracted = extract_financials_from_pdf_bytes(pdf, company_number)
 
-        try:
-            return {
-    "status": "debug",
-    "company_number": company_number,
-    "pdf_size": len(pdf),
-}
+        return {
+            "status": "success",
+            "company_number": company_number,
+            "financials": extracted,
+        }
 
-            return {
-                "status": "success",
-                "company_number": company_number,
-                "financials": extracted,
-            }
-
-        except Exception as e:
-            logger.exception("Extraction failed")
-
-            return {
+    except Exception as e:
+        logger.exception("Financial extraction failed")
+        return JSONResponse(
+            status_code=200,
+            content={
                 "status": "failed",
                 "company_number": company_number,
                 "error": str(e),
-            }
-
-    except Exception as e:
-        logger.exception("Top level failure")
-
-        return {
-            "status": "error",
-            "error": str(e),
-        }
+            },
+        )
