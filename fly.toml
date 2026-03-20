@@ -1,18 +1,23 @@
-app = "rix.co.uk-credit-file"
+# fly.toml app configuration file generated for rix-co-uk-credit-file on 2026-03-20T16:02:41Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-[env]
-  PORT = "8080"
-  EXTRACTION_TIMEOUT_SECONDS = "30"
+app = 'rix-co-uk-credit-file'
+primary_region = 'ams'
+
+[build]
 
 [http_service]
   internal_port = 8080
   force_https = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  auto_stop_machines = "off"
-  min_machines_running = 1
+  min_machines_running = 0
+  processes = ['app']
 
-  [[http_service.checks]]
-    interval = "15s"
-    timeout = "5s"
-    method = "get"
-    path = "/healthz"
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
