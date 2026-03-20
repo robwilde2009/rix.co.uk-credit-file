@@ -6,3 +6,4 @@ pdfplumber
 pdf2image
 pytesseract
 pydantic
+Pillow
