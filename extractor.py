@@ -8,6 +8,7 @@ import pytesseract
 
 
 MIN_TEXT_LENGTH = 100
+DEBUG_SNIPPET_LENGTH = 2000  # safe size
 
 
 def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
@@ -23,7 +24,6 @@ def extract_text_pdfplumber(pdf_bytes: bytes) -> str:
 
 
 def extract_text_ocr(pdf_bytes: bytes) -> str:
-    # LIMIT pages for safety
     images = convert_from_bytes(pdf_bytes, first_page=1, last_page=3, dpi=150)
 
     text_parts = []
@@ -53,7 +53,6 @@ def extract_line_value(line: str) -> Optional[int]:
     if not numbers:
         return None
 
-    # take last number (most recent year usually)
     val = numbers[-1]
 
     if val.startswith("(") and val.endswith(")"):
@@ -77,18 +76,20 @@ def find_value(text: str, keywords: List[str]) -> Optional[int]:
 
 
 def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = None) -> Dict[str, Any]:
-    # STEP 1 — Try normal extraction
+    # STEP 1 — Try PDF text
     text = extract_text_pdfplumber(pdf_bytes)
-
     method = "pdfplumber"
 
-    # STEP 2 — Fallback to OCR
+    # STEP 2 — OCR fallback
     if len(text) < MIN_TEXT_LENGTH:
         text = extract_text_ocr(pdf_bytes)
         method = "ocr"
 
     if len(text) < MIN_TEXT_LENGTH:
         raise ValueError("No readable text found (PDF + OCR failed)")
+
+    # 🔍 DEBUG SNIPPET
+    debug_snippet = text[:DEBUG_SNIPPET_LENGTH]
 
     # STEP 3 — Extract fields
     fixed_assets = find_value(text, ["fixed assets"])
@@ -98,7 +99,6 @@ def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = No
     current_liabilities = find_value(text, ["creditors", "within one year"])
     net_assets = find_value(text, ["net assets", "total equity"])
 
-    # Derived
     working_capital = None
     if current_assets is not None and current_liabilities is not None:
         working_capital = current_assets - current_liabilities
@@ -106,6 +106,10 @@ def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = No
     return {
         "company_number": company_number,
         "method": method,
+
+        # 🔥 DEBUG OUTPUT
+        "debug_text_sample": debug_snippet,
+
         "fixed_assets": fixed_assets,
         "current_assets": current_assets,
         "cash": cash,
