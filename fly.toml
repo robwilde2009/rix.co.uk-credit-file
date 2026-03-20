@@ -1,0 +1,18 @@
+app = "rix.co.uk-credit-file"
+
+[env]
+  PORT = "8080"
+  EXTRACTION_TIMEOUT_SECONDS = "30"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    method = "get"
+    path = "/healthz"
