@@ -40,6 +40,7 @@ LINE_PATTERNS = {
     ],
     "current_assets": [
         "total current assets",
+        "total assets",
         "current assets",
     ],
     "cash": [
@@ -183,7 +184,6 @@ def extract_best_value_from_line(line: str) -> Optional[int]:
     if not values:
         return None
 
-    # Ignore leading small note numbers if larger values also exist.
     large_values = [v for v in values if abs(v) >= 1000]
     if large_values:
         return large_values[-1]
@@ -209,8 +209,7 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
         if not line_matches_any(line, patterns):
             continue
 
-        score = 0
-        score += 10
+        score = 10
 
         if "total " in line_l:
             score += 8
@@ -225,7 +224,6 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
         if any(abs(v) >= 1000 for v in values):
             score += 5
 
-        # Penalise obvious section headers with no values.
         if not values:
             score -= 10
 
@@ -280,7 +278,6 @@ def build_result(
         text, LINE_PATTERNS["net_assets"]
     )
 
-    # Prefer total current liabilities if present; otherwise due-within-one-year.
     current_liabilities = (
         current_liabilities_total
         if current_liabilities_total is not None
@@ -291,7 +288,6 @@ def build_result(
     if current_assets is not None and current_liabilities is not None:
         working_capital = current_assets - current_liabilities
 
-    # For this use case, fixed_assets is best mapped to non-current/fixed-style assets.
     fixed_assets = non_current_assets
 
     debug_page_numbers: List[int] = []
