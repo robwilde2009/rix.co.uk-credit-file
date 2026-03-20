@@ -1,7 +1,5 @@
 import os
 import io
-import json
-import time
 import logging
 import multiprocessing as mp
 from typing import Any, Dict, Optional
@@ -13,13 +11,13 @@ from pydantic import BaseModel
 
 from extractor import extract_financials_from_pdf_bytes
 
-logging.basicConfig(level="INFO")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.2"
 
-CH_API_KEY = os.getenv("CH_API_KEY", "")
+CH_API_KEY = os.getenv("CH_API_KEY", "").strip()
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 CH_DOC_BASE = "https://document-api.company-information.service.gov.uk"
 
@@ -30,19 +28,11 @@ EXTRACTION_TIMEOUT = int(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "30"))
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
-# ---------------------------
-# MODELS
-# ---------------------------
-
 class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
 
-
-# ---------------------------
-# ROOT (FIX FOR 404)
-# ---------------------------
 
 @app.get("/")
 def root():
@@ -60,83 +50,195 @@ def root():
     }
 
 
-# ---------------------------
-# HEALTH
-# ---------------------------
-
 @app.get("/healthz", response_model=HealthResponse)
 def healthz():
     return HealthResponse(status="ok", service=APP_NAME, version=APP_VERSION)
 
 
-# ---------------------------
-# HELPERS
-# ---------------------------
-
-def ch_session():
+def ch_session() -> requests.Session:
     s = requests.Session()
     s.auth = (CH_API_KEY, "")
+    s.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "rix-credit-api/2.0.2",
+    })
     return s
 
 
-def ch_get(url):
+def raise_upstream_error(prefix: str, url: str, response: requests.Response) -> None:
+    body = response.text[:2000] if response.text else ""
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "message": prefix,
+            "upstream_status": response.status_code,
+            "url": url,
+            "response_text": body,
+        },
+    )
+
+
+def ch_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not CH_API_KEY:
+        raise HTTPException(status_code=500, detail="CH_API_KEY is missing")
+
     try:
-        r = ch_session().get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
+        with ch_session() as s:
+            r = s.get(url, params=params, timeout=HTTP_TIMEOUT)
+
+        if not r.ok:
+            raise_upstream_error("Companies House request failed", r.url, r)
+
         return r.json()
-    except Exception as e:
-        raise HTTPException(502, f"CH API error: {str(e)}")
+
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "CH API transport error",
+                "url": url,
+                "error": str(e),
+            },
+        )
 
 
-def doc_get(url):
+def doc_get(url: str) -> Dict[str, Any]:
+    if not CH_API_KEY:
+        raise HTTPException(status_code=500, detail="CH_API_KEY is missing")
+
     try:
-        r = ch_session().get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
+        with ch_session() as s:
+            r = s.get(url, timeout=HTTP_TIMEOUT)
+
+        if not r.ok:
+            raise_upstream_error("Document API request failed", r.url, r)
+
         return r.json()
-    except Exception as e:
-        raise HTTPException(502, f"Document API error: {str(e)}")
+
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Document API transport error",
+                "url": url,
+                "error": str(e),
+            },
+        )
 
 
-def doc_pdf(url):
+def doc_pdf(url: str) -> bytes:
+    if not CH_API_KEY:
+        raise HTTPException(status_code=500, detail="CH_API_KEY is missing")
+
     try:
-        r = ch_session().get(url, timeout=PDF_TIMEOUT, headers={"Accept": "application/pdf"})
-        r.raise_for_status()
+        with ch_session() as s:
+            r = s.get(url, timeout=PDF_TIMEOUT, headers={"Accept": "application/pdf"})
+
+        if not r.ok:
+            raise_upstream_error("PDF fetch failed", r.url, r)
+
         return r.content
-    except Exception as e:
-        raise HTTPException(502, f"PDF fetch error: {str(e)}")
+
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "PDF transport error",
+                "url": url,
+                "error": str(e),
+            },
+        )
 
 
-# ---------------------------
-# CORE LOGIC
-# ---------------------------
+def normalize_doc_url(link: Optional[str]) -> Optional[str]:
+    if not link:
+        return None
 
-def get_latest_accounts(company_number: str):
-    filings = ch_get(f"{CH_API_BASE}/company/{company_number}/filing-history")
+    link = link.strip()
+
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+
+    if "document-api.company-information.service.gov.uk" in link:
+        if link.startswith("//"):
+            return f"https:{link}"
+        if not link.startswith("https://"):
+            return f"https://{link.lstrip('/')}"
+        return link
+
+    if link.startswith("/"):
+        return f"{CH_DOC_BASE}{link}"
+
+    return f"{CH_DOC_BASE}/{link.lstrip('/')}"
+
+
+def looks_like_accounts_filing(item: Dict[str, Any]) -> bool:
+    text = " ".join([
+        str(item.get("category", "")),
+        str(item.get("description", "")),
+        str(item.get("type", "")),
+        str(item.get("subcategory", "")),
+        str(item.get("description_values", "")),
+    ]).lower()
+
+    markers = [
+        "accounts",
+        "annual accounts",
+        "micro-entity",
+        "micro entity",
+        "filleted accounts",
+        "dormant",
+        "small company accounts",
+        "total exemption",
+        "unaudited",
+        "interim",
+    ]
+    return any(m in text for m in markers)
+
+
+def get_latest_accounts(company_number: str) -> Optional[Dict[str, Any]]:
+    # Verify company exists and auth works
+    _profile = ch_get(f"{CH_API_BASE}/company/{company_number}")
+
+    filings = ch_get(
+        f"{CH_API_BASE}/company/{company_number}/filing-history",
+        params={"items_per_page": 100},
+    )
 
     for item in filings.get("items", []):
-        if "accounts" in (item.get("description") or "").lower():
-            link = item.get("links", {}).get("document_metadata")
-            if link:
-                meta_url = f"{CH_DOC_BASE}{link}"
-                metadata = doc_get(meta_url)
-                pdf_url = meta_url + "/content"
+        if not looks_like_accounts_filing(item):
+            continue
 
-                return {
-                    "filing": item,
-                    "metadata": metadata,
-                    "pdf_url": pdf_url,
-                }
+        link = item.get("links", {}).get("document_metadata")
+        meta_url = normalize_doc_url(link)
+        if not meta_url:
+            continue
+
+        metadata = doc_get(meta_url)
+        pdf_url = meta_url.rstrip("/") + "/content"
+
+        return {
+            "filing": item,
+            "metadata": metadata,
+            "pdf_url": pdf_url,
+        }
 
     return None
 
 
-def run_extraction(pdf_bytes, company_number):
+def run_extraction(pdf_bytes: bytes, company_number: str) -> Dict[str, Any]:
     def worker(q):
         try:
             result = extract_financials_from_pdf_bytes(pdf_bytes, company_number)
-            q.put(result)
+            q.put({"ok": True, "result": result})
         except Exception as e:
-            q.put({"error": str(e)})
+            q.put({"ok": False, "error": str(e)})
 
     q = mp.Queue()
     p = mp.Process(target=worker, args=(q,))
@@ -145,27 +247,32 @@ def run_extraction(pdf_bytes, company_number):
 
     if p.is_alive():
         p.terminate()
+        p.join(2)
         raise HTTPException(504, "Extraction timeout")
 
-    result = q.get()
+    if q.empty():
+        raise HTTPException(502, "Extraction failed with no result")
 
-    if "error" in result:
-        raise HTTPException(422, result["error"])
+    payload = q.get()
 
-    return result
+    if not payload.get("ok"):
+        raise HTTPException(422, payload.get("error", "Extraction failed"))
 
+    return payload["result"]
 
-# ---------------------------
-# ENDPOINTS
-# ---------------------------
 
 @app.get("/rix-credit/company/{company_number}")
 def company_bundle(company_number: str):
+    profile = ch_get(f"{CH_API_BASE}/company/{company_number}")
+    officers = ch_get(f"{CH_API_BASE}/company/{company_number}/officers")
+    pscs = ch_get(f"{CH_API_BASE}/company/{company_number}/persons-with-significant-control")
+    charges = ch_get(f"{CH_API_BASE}/company/{company_number}/charges")
+
     return {
-        "company_profile": ch_get(f"{CH_API_BASE}/company/{company_number}"),
-        "officers": ch_get(f"{CH_API_BASE}/company/{company_number}/officers"),
-        "pscs": ch_get(f"{CH_API_BASE}/company/{company_number}/persons-with-significant-control"),
-        "charges": ch_get(f"{CH_API_BASE}/company/{company_number}/charges"),
+        "company_profile": profile,
+        "officers": officers,
+        "pscs": pscs,
+        "charges": charges,
     }
 
 
@@ -202,7 +309,6 @@ def latest_accounts_financials(company_number: str):
         )
 
     pdf = doc_pdf(data["pdf_url"])
-
     result = run_extraction(pdf, company_number)
 
     return {
