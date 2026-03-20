@@ -15,7 +15,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 CH_API_KEY = os.getenv("CH_API_KEY", "").strip()
 CH_API_BASE = "https://api.company-information.service.gov.uk"
@@ -60,7 +60,7 @@ def ch_session() -> requests.Session:
     s.auth = (CH_API_KEY, "")
     s.headers.update({
         "Accept": "application/json",
-        "User-Agent": "rix-credit-api/2.0.3",
+        "User-Agent": "rix-credit-api/2.0.4",
     })
     return s
 
@@ -231,48 +231,62 @@ def get_latest_accounts(company_number: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def extraction_worker(pdf_bytes: bytes, company_number: str, q) -> None:
+    try:
+        result = extract_financials_from_pdf_bytes(pdf_bytes, company_number)
+        q.put({
+            "ok": True,
+            "result": result,
+        })
+    except Exception as e:
+        logger.exception("Extraction worker failed")
+        q.put({
+            "ok": False,
+            "error": str(e),
+        })
+
+
 def run_extraction(pdf_bytes: bytes, company_number: str) -> Dict[str, Any]:
-    def worker(q):
-        try:
-            result = extract_financials_from_pdf_bytes(pdf_bytes, company_number)
-            q.put({"ok": True, "result": result})
-        except Exception as e:
-            q.put({
-                "ok": False,
-                "error": str(e),
-            })
+    try:
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        p = ctx.Process(target=extraction_worker, args=(pdf_bytes, company_number, q))
+        p.start()
+        p.join(EXTRACTION_TIMEOUT)
 
-    q = mp.Queue()
-    p = mp.Process(target=worker, args=(q,))
-    p.start()
-    p.join(EXTRACTION_TIMEOUT)
+        if p.is_alive():
+            p.terminate()
+            p.join(2)
+            return {
+                "status": "timeout",
+                "message": f"Extraction exceeded {EXTRACTION_TIMEOUT}s",
+            }
 
-    if p.is_alive():
-        p.terminate()
-        p.join(2)
+        if q.empty():
+            return {
+                "status": "error",
+                "message": f"Extraction process ended with exit code {p.exitcode} and returned no result",
+            }
+
+        payload = q.get()
+
+        if not payload.get("ok"):
+            return {
+                "status": "failed",
+                "error": payload.get("error", "Unknown extraction error"),
+            }
+
         return {
-            "status": "timeout",
-            "message": f"Extraction exceeded {EXTRACTION_TIMEOUT}s",
+            "status": "success",
+            "data": payload["result"],
         }
 
-    if q.empty():
+    except Exception as e:
+        logger.exception("run_extraction failed")
         return {
             "status": "error",
-            "message": "Extraction returned no result",
+            "message": f"Extraction orchestration failed: {str(e)}",
         }
-
-    payload = q.get()
-
-    if not payload.get("ok"):
-        return {
-            "status": "failed",
-            "error": payload.get("error", "Unknown extraction error"),
-        }
-
-    return {
-        "status": "success",
-        "data": payload["result"],
-    }
 
 
 @app.get("/rix-credit/company/{company_number}")
