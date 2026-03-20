@@ -9,39 +9,54 @@ import pytesseract
 
 MIN_TEXT_LENGTH = 100
 OCR_FIRST_PAGE = 4
-OCR_LAST_PAGE = 7
+OCR_LAST_PAGE = 6
 OCR_DPI = 120
-DEBUG_SNIPPET_LENGTH = 2000
+DEBUG_SNIPPET_LENGTH = 2200
 
-PAGE_SIGNALS = [
-    "balance sheet",
+SECTION_HEADERS = [
+    "non-current assets",
+    "non current assets",
+    "current assets",
+    "current liabilities",
+    "non-current liabilities",
+    "non current liabilities",
+    "net assets",
+    "capital and reserves",
+    "shareholders' funds",
+    "members' funds",
+    "total equity",
+]
+
+PAGE_POSITIVE_SIGNALS = [
     "statement of financial position",
+    "balance sheet",
     "current assets",
     "current liabilities",
     "non-current assets",
     "non-current liabilities",
-    "creditors",
     "net assets",
-    "called up share capital",
-    "capital and reserves",
-    "shareholders' funds",
-    "shareholders funds",
-    "members' funds",
-    "members funds",
-    "total assets less current liabilities",
+    "total liabilities",
+]
+
+PAGE_NEGATIVE_SIGNALS = [
+    "notes to the financial statements",
+    "statement of directors",
+    "directors’ responsibilities",
+    "directors' responsibilities",
+    "statement of changes in equity",
+    "cash flow statement",
 ]
 
 LINE_PATTERNS = {
-    "non_current_assets": [
+    "non_current_assets_total": [
         "total non-current assets",
         "total non current assets",
-        "non-current assets",
-        "non current assets",
     ],
-    "current_assets": [
+    "current_assets_total": [
         "total current assets",
+    ],
+    "total_assets": [
         "total assets",
-        "current assets",
     ],
     "cash": [
         "cash and cash equivalents",
@@ -65,15 +80,15 @@ LINE_PATTERNS = {
         "amounts due within one year",
         "amounts falling due within one year",
     ],
-    "non_current_liabilities": [
+    "non_current_liabilities_total": [
         "total non-current liabilities",
         "total non current liabilities",
+    ],
+    "non_current_liabilities_after_one_year": [
         "creditors: amounts due after one year",
         "creditors: amounts falling due after more than one year",
         "amounts due after one year",
         "amounts falling due after more than one year",
-        "non-current liabilities",
-        "non current liabilities",
     ],
     "total_liabilities": [
         "total liabilities",
@@ -132,13 +147,24 @@ def extract_text_ocr_pages(pdf_bytes: bytes) -> List[str]:
 def score_page(text: str) -> int:
     t = text.lower()
     score = 0
-    for signal in PAGE_SIGNALS:
+
+    for signal in PAGE_POSITIVE_SIGNALS:
         if signal in t:
-            score += 3
+            score += 4
+
+    for signal in PAGE_NEGATIVE_SIGNALS:
+        if signal in t:
+            score -= 6
+
     if re.search(r"\b20\d{2}\b", t):
         score += 1
-    if len(re.findall(r"\(?\d[\d,]*\)?", text)) >= 5:
+
+    numeric_count = len(re.findall(r"\(?\d[\d,]*\)?", text))
+    if numeric_count >= 5:
         score += 2
+    if numeric_count >= 12:
+        score += 2
+
     return score
 
 
@@ -170,12 +196,10 @@ def parse_number(token: str) -> Optional[int]:
 def extract_candidate_numbers(line: str) -> List[int]:
     raw = re.findall(r"\(\d[\d,]*\)|-?\d[\d,]*", line)
     vals: List[int] = []
-
     for tok in raw:
         val = parse_number(tok)
         if val is not None:
             vals.append(val)
-
     return vals
 
 
@@ -195,60 +219,101 @@ def extract_best_value_from_line(line: str) -> Optional[int]:
     return values[-1]
 
 
-def line_matches_any(line: str, patterns: List[str]) -> bool:
-    line_l = line.lower()
-    return any(p in line_l for p in patterns)
+def split_lines(text: str) -> List[str]:
+    return [l.strip() for l in text.splitlines() if l.strip()]
 
 
-def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -> Optional[str]:
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+def find_section_range(lines: List[str], header_patterns: List[str], stop_patterns: List[str]) -> Tuple[int, int]:
+    start_idx = -1
+    end_idx = len(lines)
+
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if start_idx == -1 and any(p in ll for p in header_patterns):
+            start_idx = i
+            continue
+
+        if start_idx != -1 and any(p in ll for p in stop_patterns):
+            end_idx = i
+            break
+
+    if start_idx == -1:
+        return (0, len(lines))
+
+    return (start_idx, end_idx)
+
+
+def get_current_assets_section(lines: List[str]) -> List[str]:
+    start, end = find_section_range(
+        lines,
+        header_patterns=["current assets"],
+        stop_patterns=["current liabilities"],
+    )
+    section = lines[start:end]
+    out = []
+    for line in section:
+        ll = line.lower()
+        if "non-current" in ll or "non current" in ll:
+            continue
+        out.append(line)
+    return out
+
+
+def get_non_current_assets_section(lines: List[str]) -> List[str]:
+    start, end = find_section_range(
+        lines,
+        header_patterns=["non-current assets", "non current assets"],
+        stop_patterns=["current assets"],
+    )
+    return lines[start:end]
+
+
+def get_current_liabilities_section(lines: List[str]) -> List[str]:
+    start, end = find_section_range(
+        lines,
+        header_patterns=["current liabilities"],
+        stop_patterns=["non-current liabilities", "non current liabilities", "net assets", "capital and reserves"],
+    )
+    return lines[start:end]
+
+
+def get_non_current_liabilities_section(lines: List[str]) -> List[str]:
+    start, end = find_section_range(
+        lines,
+        header_patterns=["non-current liabilities", "non current liabilities"],
+        stop_patterns=["net assets", "capital and reserves", "shareholders' funds", "members' funds"],
+    )
+    return lines[start:end]
+
+
+def get_whole_balance_sheet_scope(lines: List[str]) -> List[str]:
+    return lines
+
+
+def find_best_line(lines: List[str], patterns: List[str], prefer_total: bool = False, exclude_patterns: Optional[List[str]] = None) -> Optional[str]:
+    exclude_patterns = exclude_patterns or []
     candidates: List[Tuple[int, str]] = []
 
-    section_lines = lines
-
-    # Section-aware handling for current assets
-    if any("current assets" in p for p in patterns):
-        start_idx = None
-        end_idx = None
-
-        for i, line in enumerate(lines):
-            l = line.lower()
-            if "current assets" in l and start_idx is None:
-                start_idx = i
-                continue
-            if start_idx is not None and "current liabilities" in l:
-                end_idx = i
-                break
-
-        if start_idx is not None:
-            section_lines = lines[start_idx:end_idx] if end_idx is not None else lines[start_idx:]
-
-    for line in section_lines:
+    for line in lines:
         line_l = line.lower()
 
-        # Critical fix: stop non-current lines contaminating current-assets matching
-        if any("current assets" in p for p in patterns):
-            if "non-current" in line_l or "non current" in line_l:
-                continue
+        if exclude_patterns and any(p in line_l for p in exclude_patterns):
+            continue
 
         if not any(p in line_l for p in patterns):
             continue
 
-        score = 10
+        values = extract_candidate_numbers(line)
 
+        score = 10
         if "total " in line_l:
             score += 8
-
         if prefer_total and "total " in line_l:
             score += 8
-
-        if re.search(r"\(?\d[\d,]*\)?", line):
+        if values:
             score += 5
-
-        values = extract_candidate_numbers(line)
         if any(abs(v) >= 1000 for v in values):
             score += 5
-
         if not values:
             score -= 10
 
@@ -261,8 +326,18 @@ def find_best_line(text: str, patterns: List[str], prefer_total: bool = False) -
     return candidates[0][1]
 
 
-def find_value_from_patterns(text: str, patterns: List[str], prefer_total: bool = False) -> Tuple[Optional[int], Optional[str]]:
-    line = find_best_line(text, patterns, prefer_total=prefer_total)
+def find_value_from_patterns(
+    lines: List[str],
+    patterns: List[str],
+    prefer_total: bool = False,
+    exclude_patterns: Optional[List[str]] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    line = find_best_line(
+        lines,
+        patterns=patterns,
+        prefer_total=prefer_total,
+        exclude_patterns=exclude_patterns,
+    )
     if not line:
         return None, None
     return extract_best_value_from_line(line), line
@@ -275,43 +350,101 @@ def build_result(
     debug_pages: List[Tuple[int, str]],
     page_number_offset: int = 0,
 ) -> Dict[str, Any]:
+    lines = split_lines(text)
+
+    non_current_assets_section = get_non_current_assets_section(lines)
+    current_assets_section = get_current_assets_section(lines)
+    current_liabilities_section = get_current_liabilities_section(lines)
+    non_current_liabilities_section = get_non_current_liabilities_section(lines)
+    whole_scope = get_whole_balance_sheet_scope(lines)
+
     non_current_assets, non_current_assets_line = find_value_from_patterns(
-        text, LINE_PATTERNS["non_current_assets"], prefer_total=True
-    )
-    current_assets, current_assets_line = find_value_from_patterns(
-        text, LINE_PATTERNS["current_assets"], prefer_total=True
-    )
-    cash, cash_line = find_value_from_patterns(
-        text, LINE_PATTERNS["cash"]
-    )
-    debtors, debtors_line = find_value_from_patterns(
-        text, LINE_PATTERNS["debtors"]
-    )
-    current_liabilities_total, current_liabilities_total_line = find_value_from_patterns(
-        text, LINE_PATTERNS["current_liabilities_total"], prefer_total=True
-    )
-    current_liabilities_due_within_one_year, current_liabilities_due_within_one_year_line = find_value_from_patterns(
-        text, LINE_PATTERNS["current_liabilities_due_within_one_year"]
-    )
-    non_current_liabilities, non_current_liabilities_line = find_value_from_patterns(
-        text, LINE_PATTERNS["non_current_liabilities"], prefer_total=True
-    )
-    total_liabilities, total_liabilities_line = find_value_from_patterns(
-        text, LINE_PATTERNS["total_liabilities"], prefer_total=True
-    )
-    net_assets, net_assets_line = find_value_from_patterns(
-        text, LINE_PATTERNS["net_assets"]
+        non_current_assets_section,
+        LINE_PATTERNS["non_current_assets_total"],
+        prefer_total=True,
     )
 
+    current_assets, current_assets_line = find_value_from_patterns(
+        current_assets_section,
+        LINE_PATTERNS["current_assets_total"],
+        prefer_total=True,
+    )
+
+    total_assets, total_assets_line = find_value_from_patterns(
+        current_assets_section,
+        LINE_PATTERNS["total_assets"],
+        prefer_total=True,
+        exclude_patterns=["non-current", "non current"],
+    )
+
+    debtors, debtors_line = find_value_from_patterns(
+        current_assets_section,
+        LINE_PATTERNS["debtors"],
+    )
+
+    cash, cash_line = find_value_from_patterns(
+        current_assets_section + current_liabilities_section + whole_scope,
+        LINE_PATTERNS["cash"],
+    )
+
+    current_liabilities_total, current_liabilities_total_line = find_value_from_patterns(
+        current_liabilities_section,
+        LINE_PATTERNS["current_liabilities_total"],
+        prefer_total=True,
+    )
+
+    current_liabilities_due_within_one_year, current_liabilities_due_within_one_year_line = find_value_from_patterns(
+        current_liabilities_section,
+        LINE_PATTERNS["current_liabilities_due_within_one_year"],
+    )
+
+    non_current_liabilities_total, non_current_liabilities_total_line = find_value_from_patterns(
+        non_current_liabilities_section,
+        LINE_PATTERNS["non_current_liabilities_total"],
+        prefer_total=True,
+    )
+
+    non_current_liabilities_after_one_year, non_current_liabilities_after_one_year_line = find_value_from_patterns(
+        non_current_liabilities_section,
+        LINE_PATTERNS["non_current_liabilities_after_one_year"],
+    )
+
+    total_liabilities, total_liabilities_line = find_value_from_patterns(
+        whole_scope,
+        LINE_PATTERNS["total_liabilities"],
+        prefer_total=True,
+    )
+
+    net_assets, net_assets_line = find_value_from_patterns(
+        whole_scope,
+        LINE_PATTERNS["net_assets"],
+    )
+
+    # Use total current liabilities if present, else the within-one-year line.
     current_liabilities = (
         current_liabilities_total
         if current_liabilities_total is not None
         else current_liabilities_due_within_one_year
     )
 
+    # Use total non-current liabilities if present, else after-one-year line.
+    non_current_liabilities = (
+        non_current_liabilities_total
+        if non_current_liabilities_total is not None
+        else non_current_liabilities_after_one_year
+    )
+
+    # current_assets should come from a true current-assets total.
+    # If that is missing, use total assets only as an explicit fallback.
+    final_current_assets = (
+        current_assets
+        if current_assets is not None
+        else total_assets
+    )
+
     working_capital = None
-    if current_assets is not None and current_liabilities is not None:
-        working_capital = current_assets - current_liabilities
+    if final_current_assets is not None and current_liabilities is not None:
+        working_capital = final_current_assets - current_liabilities
 
     fixed_assets = non_current_assets
 
@@ -323,31 +456,59 @@ def build_result(
         debug_page_numbers.append(page_num)
         debug_parts.append(f"[PAGE {page_num}]\n{page_text[:700]}")
 
+    populated_fields = sum(
+        v is not None for v in [
+            fixed_assets,
+            non_current_assets,
+            final_current_assets,
+            total_assets,
+            cash,
+            debtors,
+            current_liabilities,
+            non_current_liabilities,
+            total_liabilities,
+            net_assets,
+        ]
+    )
+
+    if populated_fields >= 8:
+        extraction_confidence = "high"
+    elif populated_fields >= 5:
+        extraction_confidence = "medium"
+    else:
+        extraction_confidence = "low"
+
     return {
         "company_number": company_number,
         "method": method,
+        "extraction_confidence": extraction_confidence,
         "debug_page_numbers": debug_page_numbers,
         "debug_text_sample": "\n\n".join(debug_parts)[:DEBUG_SNIPPET_LENGTH],
         "fixed_assets": fixed_assets,
         "non_current_assets": non_current_assets,
-        "current_assets": current_assets,
+        "current_assets": final_current_assets,
+        "total_assets": total_assets,
         "cash": cash,
         "debtors": debtors,
         "current_liabilities": current_liabilities,
         "current_liabilities_due_within_one_year": current_liabilities_due_within_one_year,
         "current_liabilities_total": current_liabilities_total,
         "non_current_liabilities": non_current_liabilities,
+        "non_current_liabilities_after_one_year": non_current_liabilities_after_one_year,
+        "non_current_liabilities_total": non_current_liabilities_total,
         "total_liabilities": total_liabilities,
         "working_capital": working_capital,
         "net_assets": net_assets,
         "matched_lines": {
             "non_current_assets": non_current_assets_line,
             "current_assets": current_assets_line,
+            "total_assets": total_assets_line,
             "cash": cash_line,
             "debtors": debtors_line,
             "current_liabilities_due_within_one_year": current_liabilities_due_within_one_year_line,
             "current_liabilities_total": current_liabilities_total_line,
-            "non_current_liabilities": non_current_liabilities_line,
+            "non_current_liabilities_after_one_year": non_current_liabilities_after_one_year_line,
+            "non_current_liabilities_total": non_current_liabilities_total_line,
             "total_liabilities": total_liabilities_line,
             "net_assets": net_assets_line,
         },
@@ -374,6 +535,7 @@ def extract_financials_from_pdf_bytes(pdf_bytes: bytes, company_number: str = No
             for field in [
                 "non_current_assets",
                 "current_assets",
+                "total_assets",
                 "cash",
                 "debtors",
                 "current_liabilities",
