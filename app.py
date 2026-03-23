@@ -2,7 +2,7 @@ import os
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -12,7 +12,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 # -----------------------------------------------------------------------------
 # Environment / Config
@@ -26,7 +26,7 @@ EXPERIAN_BASE_URL = os.getenv("EXPERIAN_BASE_URL", "https://sandbox-uk-api.exper
 EXPERIAN_CLIENT_ID = os.getenv("EXPERIAN_CLIENT_ID", "").strip()
 EXPERIAN_CLIENT_SECRET = os.getenv("EXPERIAN_CLIENT_SECRET", "").strip()
 
-# These are placeholders until your exact Experian product docs confirm paths.
+# Placeholder paths until exact Experian docs / payloads are confirmed
 EXPERIAN_TOKEN_PATH = os.getenv("EXPERIAN_TOKEN_PATH", "/oauth2/v1/token").strip()
 EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/businesses/v1/search").strip()
 EXPERIAN_REPORT_PATH_TEMPLATE = os.getenv(
@@ -54,7 +54,9 @@ def safe_int(value: Any) -> Optional[int]:
     try:
         if value is None or value == "":
             return None
-        return int(value)
+        if isinstance(value, bool):
+            return int(value)
+        return int(float(value))
     except Exception:
         return None
 
@@ -68,8 +70,47 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def safe_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "yes", "y", "1"}:
+            return True
+        if v in {"false", "no", "n", "0"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
 def elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def get_first(*values):
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def money(amount: Optional[float], currency: str = "GBP") -> Dict[str, Any]:
+    return {
+        "amount": amount if amount is None else float(amount),
+        "currency": currency
+    }
+
+
+def get_in(obj: Any, *path: str) -> Any:
+    cur = obj
+    for part in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
 
 
 # -----------------------------------------------------------------------------
@@ -127,10 +168,7 @@ def get_companies_house_bundle(company_number: str) -> Dict[str, Any]:
     officers_raw = safe_fetch(f"{CH_API_BASE}/company/{company_number}/officers", "officers")
     pscs_raw = safe_fetch(f"{CH_API_BASE}/company/{company_number}/persons-with-significant-control", "pscs")
     charges_raw = safe_fetch(f"{CH_API_BASE}/company/{company_number}/charges", "charges")
-    filings_raw = safe_fetch(
-        f"{CH_API_BASE}/company/{company_number}/filing-history",
-        "filing_history"
-    )
+    filings_raw = safe_fetch(f"{CH_API_BASE}/company/{company_number}/filing-history", "filing_history")
 
     return {
         "available": True,
@@ -192,7 +230,6 @@ def experian_search_company_live(
 ) -> Dict[str, Any]:
     url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
 
-    # This payload is intentionally flexible until your exact docs confirm the schema.
     payload = {
         "registrationNumber": company_number,
         "country": "GB",
@@ -210,9 +247,6 @@ def experian_search_company_live(
 
 
 def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str]:
-    """
-    Flexible extractor because exact sandbox response structure may vary by product/version.
-    """
     if not isinstance(search_payload, dict):
         return None
 
@@ -227,14 +261,7 @@ def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str
         if isinstance(candidate_list, list) and candidate_list:
             first = candidate_list[0]
             if isinstance(first, dict):
-                for key in [
-                    "businessId",
-                    "business_id",
-                    "id",
-                    "companyId",
-                    "company_id",
-                    "reference",
-                ]:
+                for key in ["businessId", "business_id", "id", "companyId", "company_id", "reference"]:
                     if first.get(key):
                         return str(first.get(key))
 
@@ -259,56 +286,254 @@ def experian_get_company_report_live(token: str, business_id: str) -> Dict[str, 
 
 
 def experian_mock_report(company_number: str, company_name: Optional[str] = None) -> Dict[str, Any]:
-    seed = sum(ord(c) for c in company_number) % 40
-    score = 45 + seed
-    risk_band = "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D"
-    limit = 50000 if score >= 80 else 25000 if score >= 65 else 12000 if score >= 50 else 3000
-    avg_dbt = max(0, 30 - (score - 45))
+    seed = sum(ord(c) for c in company_number) % 25
+    delphi_score = 75 + min(seed, 20)
+    delphi_band = (
+        "Very Low Risk" if delphi_score >= 90 else
+        "Low Risk" if delphi_score >= 80 else
+        "Low to Moderate Risk" if delphi_score >= 70 else
+        "Moderate Risk"
+    )
+
+    credit_limit_value = 110000.0 if delphi_score >= 90 else 60000.0 if delphi_score >= 80 else 25000.0
+    credit_rating_value = 35000.0 if delphi_score >= 90 else 20000.0 if delphi_score >= 80 else 12000.0
+    company_dbt = None
+    company_payment_data_available = False
+    industry_dbt_current = 45
+    ccj_count = 0
+    outstanding_charges = 2 if "SC" in company_number.upper() else 0
+    satisfied_charges = 1 if outstanding_charges > 0 else 0
+
+    history_4y = [
+        {
+            "date": "2025-05-31",
+            "turnover": None,
+            "tangible_assets": 2188002.0,
+            "total_fixed_assets": 2198002.0,
+            "debtors": 630358.0,
+            "cash_at_bank": 65452.0,
+            "total_current_assets": 709775.0,
+            "total_current_liabilities": 1129388.0,
+            "working_capital": -419613.0,
+            "capital_employed": 1778389.0,
+            "total_long_term_liabilities": 805548.0,
+            "provisions": 0.0,
+            "total_net_assets": 583876.0,
+            "shareholders_funds": 583876.0,
+            "net_worth": 583876.0,
+            "employees": None,
+        },
+        {
+            "date": "2024-05-31",
+            "turnover": None,
+            "tangible_assets": 1865427.0,
+            "total_fixed_assets": 1875427.0,
+            "debtors": 556303.0,
+            "cash_at_bank": 43383.0,
+            "total_current_assets": 616532.0,
+            "total_current_liabilities": 1048573.0,
+            "working_capital": -432041.0,
+            "capital_employed": 1443386.0,
+            "total_long_term_liabilities": 590138.0,
+            "provisions": 0.0,
+            "total_net_assets": 512345.0,
+            "shareholders_funds": 512345.0,
+            "net_worth": 512345.0,
+            "employees": None,
+        },
+        {
+            "date": "2023-05-31",
+            "turnover": None,
+            "tangible_assets": 2138697.0,
+            "total_fixed_assets": 2148697.0,
+            "debtors": 679164.0,
+            "cash_at_bank": 46494.0,
+            "total_current_assets": 742547.0,
+            "total_current_liabilities": 1375729.0,
+            "working_capital": -633182.0,
+            "capital_employed": 1515515.0,
+            "total_long_term_liabilities": 815972.0,
+            "provisions": 0.0,
+            "total_net_assets": 382877.0,
+            "shareholders_funds": 382877.0,
+            "net_worth": 382877.0,
+            "employees": None,
+        },
+        {
+            "date": "2022-05-31",
+            "turnover": None,
+            "tangible_assets": 1421829.0,
+            "total_fixed_assets": 1431829.0,
+            "debtors": 643522.0,
+            "cash_at_bank": 47249.0,
+            "total_current_assets": 701132.0,
+            "total_current_liabilities": 1285088.0,
+            "working_capital": -583956.0,
+            "capital_employed": 847873.0,
+            "total_long_term_liabilities": 348254.0,
+            "provisions": 0.0,
+            "total_net_assets": 244437.0,
+            "shareholders_funds": 244437.0,
+            "net_worth": 244437.0,
+            "employees": None,
+        },
+    ]
+
+    ratios_latest = {
+        "current_ratio": 0.63,
+        "acid_test": 0.62,
+        "debtor_days": 174.01,
+        "stock_turn_days": 20.08,
+        "gearing_pct": 137.97
+    }
 
     return {
         "available": True,
         "source": "experian_mock",
         "reference": f"EXP-{company_number}",
         "matched_company_name": company_name,
-        "score": score,
-        "score_description": (
-            "Low risk" if score >= 80 else
-            "Low to moderate risk" if score >= 65 else
-            "Moderate risk" if score >= 50 else
-            "Elevated risk"
-        ),
-        "risk_band": risk_band,
-        "credit_limit": {
-            "amount": float(limit),
-            "currency": "GBP",
-        },
+
+        # shortcut fields for simple scoring logic
+        "score": delphi_score,
+        "score_description": delphi_band,
+        "risk_band": delphi_band,
+        "credit_limit": money(credit_limit_value),
+        "credit_rating": money(credit_rating_value),
         "payment_behaviour": {
-            "days_beyond_terms": avg_dbt,
-            "average_dbt": avg_dbt,
-            "severe_dbt_flag": avg_dbt > 30,
-            "payment_trend": "stable" if score >= 60 else "mixed",
-            "ccj_flag": score < 48,
+            "average_dbt": company_dbt,
+            "company_payment_data_available": company_payment_data_available,
+            "industry_dbt_current": industry_dbt_current,
+            "ccj_count_last_2y": ccj_count,
+            "ccj_flag": ccj_count > 0,
             "insolvency_flag": False,
         },
+
+        # richer report structure
+        "opinion": {
+            "summary": "A low risk company; credit may be considered within the recommended limit."
+        },
+
+        "credit_values": {
+            "credit_limit": money(credit_limit_value),
+            "credit_rating": money(credit_rating_value),
+        },
+
+        "commercial_delphi": {
+            "score": delphi_score,
+            "band": delphi_band,
+            "failure_odds": "176:1" if delphi_score >= 90 else "48:1" if delphi_score >= 80 else "24:1",
+            "calculated_at": now_utc_iso(),
+            "history_12m": [
+                {"period": "2025-03", "score": delphi_score - 2, "credit_limit": credit_limit_value - 5000, "credit_rating": credit_rating_value - 3000},
+                {"period": "2025-06", "score": delphi_score - 1, "credit_limit": credit_limit_value, "credit_rating": credit_rating_value},
+                {"period": "2025-09", "score": delphi_score, "credit_limit": credit_limit_value, "credit_rating": credit_rating_value},
+                {"period": "2025-12", "score": delphi_score, "credit_limit": credit_limit_value, "credit_rating": credit_rating_value},
+            ],
+            "sector_comparisons": {
+                "same_industry_group": {
+                    "average_score": 39,
+                    "failure_odds": "16:1",
+                    "percentile_or_better_than": 98 if delphi_score >= 90 else 85
+                },
+                "same_asset_size_group": {
+                    "average_score": 68,
+                    "failure_odds": "32:1",
+                    "percentile_or_better_than": 85
+                },
+                "same_age_group": {
+                    "average_score": 63,
+                    "failure_odds": "29:1",
+                    "percentile_or_better_than": 90
+                },
+                "comparison_sector_details": {
+                    "industry_group": "Land Transport; Transport Via Pipelines",
+                    "asset_size_group": "£1,000,000 to £5,000,000",
+                    "age_group": "Incorporated between March 1995 and March 2006"
+                }
+            }
+        },
+
+        "payment_profile": {
+            "company_payment_data_available": company_payment_data_available,
+            "company_dbt": company_dbt,
+            "company_dbt_text": "There is no current payment performance data for this company" if not company_payment_data_available else None,
+            "industry_dbt": {
+                "current": industry_dbt_current,
+                "last_3m": 44,
+                "last_6m": 43,
+                "last_12m": 44,
+            },
+            "unpaid_accounts": {
+                "one_month": None,
+                "two_months": None,
+                "three_plus_months": None,
+            },
+            "trend": "unknown"
+        },
+
+        "legal": {
+            "ccj_count_last_2y": ccj_count,
+            "ccj_flag": ccj_count > 0,
+            "most_recent_legal_notices_text": "No Legal Notices Recorded",
+            "legal_notices_count": 0
+        },
+
+        "alerts": {
+            "count": 1,
+            "items": [
+                {
+                    "type": "director_alert",
+                    "text": "Review other directorships of the current board."
+                }
+            ]
+        },
+
         "financials": {
-            "turnover": 1800000.0 if score >= 60 else 850000.0,
-            "total_assets": 620000.0 if score >= 60 else 250000.0,
-            "current_assets": 310000.0 if score >= 60 else 90000.0,
-            "current_liabilities": 190000.0 if score >= 60 else 120000.0,
-            "net_worth": 210000.0 if score >= 60 else 35000.0,
-            "cash": 92000.0 if score >= 60 else 18000.0,
+            "currency": "GBP",
+            "latest_accounts_date": history_4y[0]["date"],
+            "latest_confirmation_date": None,
+            "accounts_reference_date": None,
+            "summary_latest": {
+                "turnover": 2907777.0,
+                "pre_tax_profit": None,
+                "pre_tax_profit_margin_pct": None,
+                "total_assets": history_4y[0]["total_fixed_assets"] + history_4y[0]["total_current_assets"],
+                "working_capital": history_4y[0]["working_capital"],
+                "shareholders_funds": history_4y[0]["shareholders_funds"],
+            },
+            "history_4y": history_4y,
+            "ratios": {
+                "latest": ratios_latest,
+                "history_4y": [
+                    {"date": "2025-05-31", **ratios_latest},
+                    {"date": "2024-05-31", "current_ratio": 0.59, "acid_test": 0.58, "debtor_days": 165.4, "stock_turn_days": 18.2, "gearing_pct": 115.2},
+                    {"date": "2023-05-31", "current_ratio": 0.54, "acid_test": 0.53, "debtor_days": 177.8, "stock_turn_days": 22.1, "gearing_pct": 213.1},
+                    {"date": "2022-05-31", "current_ratio": 0.55, "acid_test": 0.54, "debtor_days": 169.2, "stock_turn_days": 19.7, "gearing_pct": 142.5},
+                ]
+            },
+            "cash_flow_available": False,
+            "profit_loss_available": False,
         },
-        "group_links": {
-            "is_group_member": score >= 70,
-            "parent_name": "Example Holdings Ltd" if score >= 70 else None,
-            "parent_company_number": "07654321" if score >= 70 else None,
-            "ultimate_parent_name": None,
-            "linked_entities": [],
+
+        "directors_summary": {
+            "current_directors_count": 2,
+            "current_directors_may_also_be_shareholders": 2
         },
+
+        "corporate_structure": {
+            "is_group_member": False,
+            "summary": "This company is not part of a group"
+        },
+
+        "charges_summary": {
+            "outstanding_count": outstanding_charges,
+            "satisfied_count": satisfied_charges
+        },
+
         "warnings": [],
         "raw": {
             "mode": "mock",
-            "company_number": company_number,
+            "company_number": company_number
         },
     }
 
@@ -319,61 +544,530 @@ def map_experian_live_payload(
     matched_company_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    This is intentionally tolerant and will need tightening once you confirm
-    the exact Commercial Credit sandbox response fields.
+    Provider-tolerant mapping. Tighten once actual Commercial Credit sandbox
+    response fields are confirmed.
     """
-    financials = raw_report.get("financials") or raw_report.get("financialInformation") or {}
-    group_links = raw_report.get("group_links") or raw_report.get("corporateLinkage") or {}
-    payment = raw_report.get("payment_behaviour") or raw_report.get("paymentBehaviour") or {}
 
-    credit_limit_value = None
-    raw_credit_limit = raw_report.get("credit_limit") or raw_report.get("creditLimit")
-    if isinstance(raw_credit_limit, dict):
-        credit_limit_value = safe_float(raw_credit_limit.get("amount"))
-    else:
-        credit_limit_value = safe_float(raw_credit_limit)
+    # top-level and nested candidate sources
+    delphi_src = get_first(
+        raw_report.get("commercial_delphi"),
+        raw_report.get("commercialDelphi"),
+        raw_report.get("delphi"),
+        {}
+    ) or {}
+
+    payment_src = get_first(
+        raw_report.get("payment_profile"),
+        raw_report.get("paymentProfile"),
+        raw_report.get("payment_behaviour"),
+        raw_report.get("paymentBehaviour"),
+        {}
+    ) or {}
+
+    legal_src = get_first(
+        raw_report.get("legal"),
+        raw_report.get("legalNotices"),
+        raw_report.get("courtInformation"),
+        {}
+    ) or {}
+
+    alerts_src = get_first(
+        raw_report.get("alerts"),
+        raw_report.get("alertsSummary"),
+        {}
+    ) or {}
+
+    financials_src = get_first(
+        raw_report.get("financials"),
+        raw_report.get("financialInformation"),
+        raw_report.get("accounts"),
+        {}
+    ) or {}
+
+    directors_src = get_first(
+        raw_report.get("directors_summary"),
+        raw_report.get("directorsSummary"),
+        {}
+    ) or {}
+
+    corporate_src = get_first(
+        raw_report.get("corporate_structure"),
+        raw_report.get("corporateStructure"),
+        raw_report.get("group_links"),
+        raw_report.get("corporateLinkage"),
+        {}
+    ) or {}
+
+    charges_src = get_first(
+        raw_report.get("charges_summary"),
+        raw_report.get("chargesSummary"),
+        {}
+    ) or {}
+
+    opinion_src = get_first(
+        raw_report.get("opinion"),
+        raw_report.get("creditOpinion"),
+        {}
+    ) or {}
+
+    credit_limit_value = safe_float(
+        get_first(
+            get_in(raw_report, "credit_limit", "amount"),
+            get_in(raw_report, "creditLimit", "amount"),
+            raw_report.get("credit_limit"),
+            raw_report.get("creditLimit"),
+            get_in(raw_report, "credit_values", "credit_limit", "amount"),
+            get_in(raw_report, "creditValues", "creditLimit", "amount"),
+        )
+    )
+
+    credit_rating_value = safe_float(
+        get_first(
+            get_in(raw_report, "credit_rating", "amount"),
+            get_in(raw_report, "creditRating", "amount"),
+            raw_report.get("credit_rating"),
+            raw_report.get("creditRating"),
+            get_in(raw_report, "credit_values", "credit_rating", "amount"),
+            get_in(raw_report, "creditValues", "creditRating", "amount"),
+        )
+    )
+
+    delphi_score = safe_int(
+        get_first(
+            raw_report.get("score"),
+            raw_report.get("commercial_delphi_score"),
+            raw_report.get("commercialDelphiScore"),
+            delphi_src.get("score"),
+            delphi_src.get("commercialDelphiScore"),
+        )
+    )
+
+    delphi_band = get_first(
+        raw_report.get("risk_band"),
+        raw_report.get("commercial_delphi_band"),
+        raw_report.get("commercialDelphiBand"),
+        delphi_src.get("band"),
+        delphi_src.get("riskBand"),
+        delphi_src.get("commercialDelphiBand"),
+    )
+
+    company_dbt = safe_int(
+        get_first(
+            payment_src.get("company_dbt"),
+            payment_src.get("companyDBT"),
+            payment_src.get("average_dbt"),
+            payment_src.get("averageDBT"),
+            raw_report.get("company_dbt"),
+            raw_report.get("companyDBT"),
+        )
+    )
+
+    company_payment_data_available = safe_bool(
+        get_first(
+            payment_src.get("company_payment_data_available"),
+            payment_src.get("companyPaymentDataAvailable"),
+            raw_report.get("company_payment_data_available"),
+            raw_report.get("companyPaymentDataAvailable"),
+        )
+    )
+
+    industry_dbt_current = safe_int(
+        get_first(
+            get_in(payment_src, "industry_dbt", "current"),
+            get_in(payment_src, "industryDBT", "current"),
+            payment_src.get("industry_dbt_current"),
+            payment_src.get("industryDBTCurrent"),
+            raw_report.get("industry_dbt_current"),
+            raw_report.get("industryDBTCurrent"),
+        )
+    )
+
+    ccj_count_last_2y = safe_int(
+        get_first(
+            legal_src.get("ccj_count_last_2y"),
+            legal_src.get("ccjCountLast2Y"),
+            legal_src.get("ccj_count"),
+            raw_report.get("ccj_count_last_2y"),
+            raw_report.get("ccjCountLast2Y"),
+        )
+    )
+
+    insolvency_flag = safe_bool(
+        get_first(
+            legal_src.get("insolvency_flag"),
+            legal_src.get("insolvencyFlag"),
+            raw_report.get("insolvency_flag"),
+            raw_report.get("insolvencyFlag"),
+        )
+    )
+    if insolvency_flag is None:
+        insolvency_count = safe_int(get_first(
+            legal_src.get("insolvency_count"),
+            legal_src.get("insolvencyCount"),
+            raw_report.get("insolvency_count"),
+            raw_report.get("insolvencyCount"),
+        ))
+        insolvency_flag = False if insolvency_count in (None, 0) else True
+
+    summary_latest = get_first(
+        financials_src.get("summary_latest"),
+        financials_src.get("summaryLatest"),
+        raw_report.get("financial_summary_latest"),
+        raw_report.get("financialSummaryLatest"),
+        {}
+    ) or {}
+
+    history_4y = get_first(
+        financials_src.get("history_4y"),
+        financials_src.get("history4y"),
+        raw_report.get("financial_history_4y"),
+        raw_report.get("financialHistory4Y"),
+        []
+    ) or []
+
+    ratios = get_first(
+        financials_src.get("ratios"),
+        raw_report.get("financial_ratios"),
+        raw_report.get("financialRatios"),
+        {}
+    ) or {}
+
+    alerts_items = get_first(
+        alerts_src.get("items"),
+        alerts_src.get("alerts"),
+        raw_report.get("alerts"),
+        []
+    ) or []
+
+    alerts_count = safe_int(
+        get_first(
+            alerts_src.get("count"),
+            alerts_src.get("alerts_count"),
+            raw_report.get("alerts_count"),
+            raw_report.get("alertsCount"),
+            len(alerts_items) if isinstance(alerts_items, list) else None,
+        )
+    )
+
+    corporate_is_group_member = safe_bool(
+        get_first(
+            corporate_src.get("is_group_member"),
+            corporate_src.get("isGroupMember"),
+            raw_report.get("is_group_member"),
+            raw_report.get("isGroupMember"),
+        )
+    )
 
     return {
         "available": True,
         "source": "experian_live",
-        "reference": raw_report.get("reference") or raw_report.get("reportId") or business_id,
+        "reference": get_first(raw_report.get("reference"), raw_report.get("reportId"), business_id),
         "matched_company_name": matched_company_name,
-        "score": safe_int(raw_report.get("score") or raw_report.get("commercialScore")),
-        "score_description": raw_report.get("score_description") or raw_report.get("scoreText"),
-        "risk_band": raw_report.get("risk_band") or raw_report.get("riskBand"),
-        "credit_limit": {
-            "amount": credit_limit_value,
-            "currency": "GBP",
-        },
+
+        # simple top-level shortcuts
+        "score": delphi_score,
+        "score_description": delphi_band,
+        "risk_band": delphi_band,
+        "credit_limit": money(credit_limit_value),
+        "credit_rating": money(credit_rating_value),
         "payment_behaviour": {
-            "days_beyond_terms": safe_int(
-                payment.get("days_beyond_terms") or payment.get("daysBeyondTerms")
-            ),
-            "average_dbt": safe_int(
-                payment.get("average_dbt") or payment.get("averageDBT")
-            ),
-            "severe_dbt_flag": payment.get("severe_dbt_flag"),
-            "payment_trend": payment.get("payment_trend") or payment.get("trend"),
-            "ccj_flag": payment.get("ccj_flag"),
-            "insolvency_flag": payment.get("insolvency_flag"),
+            "average_dbt": company_dbt,
+            "company_payment_data_available": company_payment_data_available,
+            "industry_dbt_current": industry_dbt_current,
+            "ccj_count_last_2y": ccj_count_last_2y,
+            "ccj_flag": (ccj_count_last_2y or 0) > 0,
+            "insolvency_flag": bool(insolvency_flag),
         },
+
+        # richer structure
+        "opinion": {
+            "summary": get_first(opinion_src.get("summary"), raw_report.get("credit_opinion"), raw_report.get("creditOpinion"))
+        },
+
+        "credit_values": {
+            "credit_limit": money(credit_limit_value),
+            "credit_rating": money(credit_rating_value),
+        },
+
+        "commercial_delphi": {
+            "score": delphi_score,
+            "band": delphi_band,
+            "failure_odds": get_first(
+                delphi_src.get("failure_odds"),
+                delphi_src.get("failureOdds"),
+                raw_report.get("failure_odds"),
+                raw_report.get("failureOdds")
+            ),
+            "calculated_at": get_first(
+                delphi_src.get("calculated_at"),
+                delphi_src.get("calculatedAt"),
+                raw_report.get("delphi_calculated_at"),
+                raw_report.get("delphiCalculatedAt")
+            ),
+            "history_12m": get_first(
+                delphi_src.get("history_12m"),
+                delphi_src.get("history12m"),
+                raw_report.get("commercial_delphi_history_12m"),
+                raw_report.get("commercialDelphiHistory12M"),
+                []
+            ) or [],
+            "sector_comparisons": get_first(
+                delphi_src.get("sector_comparisons"),
+                delphi_src.get("sectorComparisons"),
+                raw_report.get("sector_comparisons"),
+                raw_report.get("sectorComparisons"),
+                {}
+            ) or {}
+        },
+
+        "payment_profile": {
+            "company_payment_data_available": company_payment_data_available,
+            "company_dbt": company_dbt,
+            "company_dbt_text": get_first(
+                payment_src.get("company_dbt_text"),
+                payment_src.get("companyDBTText"),
+                raw_report.get("company_dbt_text"),
+                raw_report.get("companyDBTText")
+            ),
+            "industry_dbt": {
+                "current": industry_dbt_current,
+                "last_3m": safe_int(get_first(
+                    get_in(payment_src, "industry_dbt", "last_3m"),
+                    get_in(payment_src, "industryDBT", "last3m"),
+                    payment_src.get("industry_dbt_last_3m"),
+                    payment_src.get("industryDBTLast3M"),
+                    raw_report.get("industry_dbt_last_3m"),
+                    raw_report.get("industryDBTLast3M")
+                )),
+                "last_6m": safe_int(get_first(
+                    get_in(payment_src, "industry_dbt", "last_6m"),
+                    get_in(payment_src, "industryDBT", "last6m"),
+                    payment_src.get("industry_dbt_last_6m"),
+                    payment_src.get("industryDBTLast6M"),
+                    raw_report.get("industry_dbt_last_6m"),
+                    raw_report.get("industryDBTLast6M")
+                )),
+                "last_12m": safe_int(get_first(
+                    get_in(payment_src, "industry_dbt", "last_12m"),
+                    get_in(payment_src, "industryDBT", "last12m"),
+                    payment_src.get("industry_dbt_last_12m"),
+                    payment_src.get("industryDBTLast12M"),
+                    raw_report.get("industry_dbt_last_12m"),
+                    raw_report.get("industryDBTLast12M")
+                )),
+            },
+            "unpaid_accounts": {
+                "one_month": safe_int(get_first(
+                    get_in(payment_src, "unpaid_accounts", "one_month"),
+                    get_in(payment_src, "unpaidAccounts", "oneMonth"),
+                    payment_src.get("unpaid_accounts_1m"),
+                    raw_report.get("unpaid_accounts_1m")
+                )),
+                "two_months": safe_int(get_first(
+                    get_in(payment_src, "unpaid_accounts", "two_months"),
+                    get_in(payment_src, "unpaidAccounts", "twoMonths"),
+                    payment_src.get("unpaid_accounts_2m"),
+                    raw_report.get("unpaid_accounts_2m")
+                )),
+                "three_plus_months": safe_int(get_first(
+                    get_in(payment_src, "unpaid_accounts", "three_plus_months"),
+                    get_in(payment_src, "unpaidAccounts", "threePlusMonths"),
+                    payment_src.get("unpaid_accounts_3m_plus"),
+                    raw_report.get("unpaid_accounts_3m_plus")
+                )),
+            },
+            "trend": get_first(payment_src.get("trend"), payment_src.get("payment_trend"), raw_report.get("payment_trend")),
+        },
+
+        "legal": {
+            "ccj_count_last_2y": ccj_count_last_2y,
+            "ccj_flag": (ccj_count_last_2y or 0) > 0,
+            "most_recent_legal_notices_text": get_first(
+                legal_src.get("most_recent_legal_notices_text"),
+                legal_src.get("legalNoticesText"),
+                raw_report.get("legal_notices_text"),
+                raw_report.get("legalNoticesText")
+            ),
+            "legal_notices_count": safe_int(get_first(
+                legal_src.get("legal_notices_count"),
+                legal_src.get("legalNoticesCount"),
+                raw_report.get("legal_notices_count"),
+                raw_report.get("legalNoticesCount")
+            ))
+        },
+
+        "alerts": {
+            "count": alerts_count,
+            "items": alerts_items if isinstance(alerts_items, list) else []
+        },
+
         "financials": {
-            "turnover": safe_float(financials.get("turnover")),
-            "total_assets": safe_float(financials.get("total_assets") or financials.get("totalAssets")),
-            "current_assets": safe_float(financials.get("current_assets") or financials.get("currentAssets")),
-            "current_liabilities": safe_float(financials.get("current_liabilities") or financials.get("currentLiabilities")),
-            "net_worth": safe_float(financials.get("net_worth") or financials.get("netWorth")),
-            "cash": safe_float(financials.get("cash")),
+            "currency": get_first(financials_src.get("currency"), raw_report.get("financial_currency"), "GBP"),
+            "latest_accounts_date": get_first(
+                financials_src.get("latest_accounts_date"),
+                financials_src.get("latestAccountsDate"),
+                raw_report.get("latest_accounts_date"),
+                raw_report.get("latestAccountsDate")
+            ),
+            "latest_confirmation_date": get_first(
+                financials_src.get("latest_confirmation_date"),
+                financials_src.get("latestConfirmationDate"),
+                raw_report.get("latest_confirmation_date"),
+                raw_report.get("latestConfirmationDate")
+            ),
+            "accounts_reference_date": get_first(
+                financials_src.get("accounts_reference_date"),
+                financials_src.get("accountsReferenceDate"),
+                raw_report.get("accounts_reference_date"),
+                raw_report.get("accountsReferenceDate")
+            ),
+            "summary_latest": summary_latest if isinstance(summary_latest, dict) else {},
+            "history_4y": history_4y if isinstance(history_4y, list) else [],
+            "ratios": ratios if isinstance(ratios, dict) else {},
+            "cash_flow_available": safe_bool(get_first(
+                financials_src.get("cash_flow_available"),
+                financials_src.get("cashFlowAvailable"),
+                raw_report.get("cash_flow_available"),
+                raw_report.get("cashFlowAvailable")
+            )),
+            "profit_loss_available": safe_bool(get_first(
+                financials_src.get("profit_loss_available"),
+                financials_src.get("profitLossAvailable"),
+                raw_report.get("profit_loss_available"),
+                raw_report.get("profitLossAvailable")
+            )),
         },
-        "group_links": {
-            "is_group_member": group_links.get("is_group_member") or group_links.get("isGroupMember"),
-            "parent_name": group_links.get("parent_name") or group_links.get("parentName"),
-            "parent_company_number": group_links.get("parent_company_number") or group_links.get("parentCompanyNumber"),
-            "ultimate_parent_name": group_links.get("ultimate_parent_name") or group_links.get("ultimateParentName"),
-            "linked_entities": group_links.get("linked_entities") or group_links.get("linkedEntities") or [],
+
+        "directors_summary": {
+            "current_directors_count": safe_int(get_first(
+                directors_src.get("current_directors_count"),
+                directors_src.get("currentDirectorsCount"),
+                raw_report.get("current_directors_count"),
+                raw_report.get("currentDirectorsCount")
+            )),
+            "current_directors_may_also_be_shareholders": safe_int(get_first(
+                directors_src.get("current_directors_may_also_be_shareholders"),
+                directors_src.get("currentDirectorsMayAlsoBeShareholders"),
+                raw_report.get("current_directors_may_also_be_shareholders"),
+                raw_report.get("currentDirectorsMayAlsoBeShareholders")
+            )),
         },
+
+        "corporate_structure": {
+            "is_group_member": corporate_is_group_member,
+            "summary": get_first(
+                corporate_src.get("summary"),
+                corporate_src.get("structureSummary"),
+                corporate_src.get("parent_name"),
+                corporate_src.get("parentName"),
+                raw_report.get("corporate_structure_summary")
+            )
+        },
+
+        "charges_summary": {
+            "outstanding_count": safe_int(get_first(
+                charges_src.get("outstanding_count"),
+                charges_src.get("outstandingCount"),
+                raw_report.get("outstanding_charges_count"),
+                raw_report.get("outstandingChargesCount")
+            )),
+            "satisfied_count": safe_int(get_first(
+                charges_src.get("satisfied_count"),
+                charges_src.get("satisfiedCount"),
+                raw_report.get("satisfied_charges_count"),
+                raw_report.get("satisfiedChargesCount")
+            ))
+        },
+
         "warnings": [],
         "raw": raw_report,
+    }
+
+
+def empty_experian_response(source: str, company_name: Optional[str], warning: str, raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "available": False,
+        "source": source,
+        "reference": None,
+        "matched_company_name": company_name,
+        "score": None,
+        "score_description": None,
+        "risk_band": None,
+        "credit_limit": money(None),
+        "credit_rating": money(None),
+        "payment_behaviour": {
+            "average_dbt": None,
+            "company_payment_data_available": None,
+            "industry_dbt_current": None,
+            "ccj_count_last_2y": None,
+            "ccj_flag": False,
+            "insolvency_flag": False,
+        },
+        "opinion": {"summary": None},
+        "credit_values": {
+            "credit_limit": money(None),
+            "credit_rating": money(None),
+        },
+        "commercial_delphi": {
+            "score": None,
+            "band": None,
+            "failure_odds": None,
+            "calculated_at": None,
+            "history_12m": [],
+            "sector_comparisons": {},
+        },
+        "payment_profile": {
+            "company_payment_data_available": None,
+            "company_dbt": None,
+            "company_dbt_text": None,
+            "industry_dbt": {
+                "current": None,
+                "last_3m": None,
+                "last_6m": None,
+                "last_12m": None,
+            },
+            "unpaid_accounts": {
+                "one_month": None,
+                "two_months": None,
+                "three_plus_months": None,
+            },
+            "trend": None,
+        },
+        "legal": {
+            "ccj_count_last_2y": None,
+            "ccj_flag": False,
+            "most_recent_legal_notices_text": None,
+            "legal_notices_count": None,
+        },
+        "alerts": {
+            "count": None,
+            "items": [],
+        },
+        "financials": {
+            "currency": "GBP",
+            "latest_accounts_date": None,
+            "latest_confirmation_date": None,
+            "accounts_reference_date": None,
+            "summary_latest": {},
+            "history_4y": [],
+            "ratios": {},
+            "cash_flow_available": None,
+            "profit_loss_available": None,
+        },
+        "directors_summary": {
+            "current_directors_count": None,
+            "current_directors_may_also_be_shareholders": None,
+        },
+        "corporate_structure": {
+            "is_group_member": None,
+            "summary": None,
+        },
+        "charges_summary": {
+            "outstanding_count": None,
+            "satisfied_count": None,
+        },
+        "warnings": [warning],
+        "raw": raw,
     }
 
 
@@ -387,84 +1081,30 @@ def get_experian_report(company_number: str, company_name: Optional[str] = None)
         business_id = experian_extract_business_id(search_result)
 
         if not business_id:
-            return {
-                "available": False,
-                "source": "experian_live",
-                "reference": None,
-                "matched_company_name": company_name,
-                "score": None,
-                "score_description": None,
-                "risk_band": None,
-                "credit_limit": {"amount": None, "currency": "GBP"},
-                "payment_behaviour": {
-                    "days_beyond_terms": None,
-                    "average_dbt": None,
-                    "severe_dbt_flag": None,
-                    "payment_trend": None,
-                    "ccj_flag": None,
-                    "insolvency_flag": None,
-                },
-                "financials": {
-                    "turnover": None,
-                    "total_assets": None,
-                    "current_assets": None,
-                    "current_liabilities": None,
-                    "net_worth": None,
-                    "cash": None,
-                },
-                "group_links": {
-                    "is_group_member": None,
-                    "parent_name": None,
-                    "parent_company_number": None,
-                    "ultimate_parent_name": None,
-                    "linked_entities": [],
-                },
-                "warnings": ["Experian search returned no usable business ID"],
-                "raw": {
-                    "search_result": search_result
-                },
-            }
+            return empty_experian_response(
+                source="experian_live",
+                company_name=company_name,
+                warning="Experian search returned no usable business ID",
+                raw={"search_result": search_result}
+            )
 
         raw_report = experian_get_company_report_live(token, business_id)
-        return map_experian_live_payload(raw_report, business_id=business_id, matched_company_name=company_name)
+        mapped = map_experian_live_payload(raw_report, business_id=business_id, matched_company_name=company_name)
+        if "search_result" not in mapped["raw"]:
+            mapped["raw"] = {
+                "search_result": search_result,
+                "report_result": raw_report
+            }
+        return mapped
 
     except Exception as e:
         logger.exception("Experian fetch failed")
-        return {
-            "available": False,
-            "source": "experian_live",
-            "reference": None,
-            "matched_company_name": company_name,
-            "score": None,
-            "score_description": None,
-            "risk_band": None,
-            "credit_limit": {"amount": None, "currency": "GBP"},
-            "payment_behaviour": {
-                "days_beyond_terms": None,
-                "average_dbt": None,
-                "severe_dbt_flag": None,
-                "payment_trend": None,
-                "ccj_flag": None,
-                "insolvency_flag": None,
-            },
-            "financials": {
-                "turnover": None,
-                "total_assets": None,
-                "current_assets": None,
-                "current_liabilities": None,
-                "net_worth": None,
-                "cash": None,
-            },
-            "group_links": {
-                "is_group_member": None,
-                "parent_name": None,
-                "parent_company_number": None,
-                "ultimate_parent_name": None,
-                "linked_entities": [],
-            },
-            "warnings": [f"Experian fetch failed: {str(e)}"],
-            "raw": None,
-        }
+        return empty_experian_response(
+            source="experian_live",
+            company_name=company_name,
+            warning=f"Experian fetch failed: {str(e)}",
+            raw=None
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -477,20 +1117,75 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
     caps_applied: List[str] = []
     warnings: List[str] = []
 
-    financials = experian.get("financials") or {}
     payment = experian.get("payment_behaviour") or {}
     charges = companies_house.get("charges") or []
+    profile = companies_house.get("company_profile") or {}
 
-    net_worth = safe_float(financials.get("net_worth"))
-    current_assets = safe_float(financials.get("current_assets"))
-    current_liabilities = safe_float(financials.get("current_liabilities"))
+    # Prefer 4Y latest financial history if present, otherwise summary
+    financials = experian.get("financials") or {}
+    history_4y = financials.get("history_4y") or []
+    latest_hist = history_4y[0] if isinstance(history_4y, list) and history_4y else {}
+    summary_latest = financials.get("summary_latest") or {}
+
+    net_worth = safe_float(get_first(
+        latest_hist.get("net_worth"),
+        latest_hist.get("shareholders_funds"),
+        summary_latest.get("shareholders_funds"),
+        summary_latest.get("net_worth"),
+    ))
+    current_assets = safe_float(get_first(
+        latest_hist.get("total_current_assets"),
+        summary_latest.get("current_assets"),
+    ))
+    current_liabilities = safe_float(get_first(
+        latest_hist.get("total_current_liabilities"),
+        summary_latest.get("current_liabilities"),
+    ))
     avg_dbt = safe_int(payment.get("average_dbt"))
+    delphi_score = safe_int(experian.get("score"))
+    credit_limit_value = safe_float(get_in(experian, "credit_limit", "amount"))
+    credit_rating_value = safe_float(get_in(experian, "credit_rating", "amount"))
+    ccj_count = safe_int(payment.get("ccj_count_last_2y")) or 0
+    outstanding_charges = safe_int(get_in(experian, "charges_summary", "outstanding_count"))
+
+    if delphi_score is not None:
+        if delphi_score >= 90:
+            score += 18
+            drivers.append("Excellent Delphi score")
+        elif delphi_score >= 80:
+            score += 12
+            drivers.append("Strong Delphi score")
+        elif delphi_score >= 70:
+            score += 8
+            drivers.append("Good Delphi score")
+        elif delphi_score < 50:
+            score -= 12
+            drivers.append("Weak Delphi score")
+
+    if credit_rating_value is not None:
+        if credit_rating_value >= 50000:
+            score += 10
+            drivers.append("Strong Experian credit rating")
+        elif credit_rating_value >= 20000:
+            score += 6
+            drivers.append("Supportive Experian credit rating")
+        elif credit_rating_value <= 5000:
+            score -= 8
+            drivers.append("Constrained Experian credit rating")
+
+    if credit_limit_value is not None:
+        if credit_limit_value >= 100000:
+            score += 8
+            drivers.append("High bureau credit limit")
+        elif credit_limit_value >= 25000:
+            score += 4
+            drivers.append("Supportive bureau credit limit")
 
     if net_worth is not None:
-        if net_worth > 200000:
-            score += 15
+        if net_worth > 500000:
+            score += 12
             drivers.append("Strong net worth")
-        elif net_worth > 50000:
+        elif net_worth > 100000:
             score += 8
             drivers.append("Positive net worth")
         elif net_worth < 0:
@@ -506,12 +1201,12 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
             score += 5
             drivers.append("Adequate liquidity")
         else:
-            score -= 12
+            score -= 8
             drivers.append("Weak liquidity")
 
     if avg_dbt is not None:
         if avg_dbt <= 10:
-            score += 8
+            score += 6
             drivers.append("Good payment behaviour")
         elif avg_dbt <= 30:
             score += 2
@@ -519,26 +1214,32 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
         else:
             score -= 12
             drivers.append("Poor payment behaviour")
+    else:
+        company_payment_data_available = safe_bool(payment.get("company_payment_data_available"))
+        if company_payment_data_available is False:
+            warnings.append("No company payment performance data available")
 
-    if payment.get("ccj_flag"):
-        score -= 20
-        drivers.append("CCJ/adverse indicator present")
-        caps_applied.append("adverse_events_cap")
+    if ccj_count > 0:
+        score -= min(25, ccj_count * 10)
+        drivers.append("CCJ history present")
+        caps_applied.append("ccj_cap")
 
     if payment.get("insolvency_flag"):
         score -= 25
         drivers.append("Insolvency indicator present")
         caps_applied.append("insolvency_cap")
 
-    if len(charges) > 0:
-        score -= min(10, len(charges) * 2)
-        drivers.append("Charge history present")
+    ch_outstanding = len([c for c in charges if str(c.get("status", "")).lower() == "outstanding"])
+    effective_outstanding_charges = outstanding_charges if outstanding_charges is not None else ch_outstanding
+
+    if effective_outstanding_charges > 0:
+        score -= min(10, effective_outstanding_charges * 3)
+        drivers.append("Outstanding charge history present")
         caps_applied.append("charges_cap")
 
-    profile = companies_house.get("company_profile") or {}
     status = str(profile.get("company_status", "")).lower().strip()
     if status and status != "active":
-        score -= 20
+        score -= 25
         drivers.append(f"Company status is {status}")
         caps_applied.append("status_cap")
 
@@ -551,36 +1252,33 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
 
     score = max(0, min(100, score))
 
-    if score >= 80:
+    if score >= 85:
         grade = "A"
         risk_label = "Low"
-        limit = 50000
-    elif score >= 65:
+        limit = credit_limit_value or 50000
+    elif score >= 70:
         grade = "B"
         risk_label = "Low to Moderate"
-        limit = 25000
-    elif score >= 50:
+        limit = min(credit_limit_value or 25000, max(25000.0, credit_rating_value or 25000.0))
+    elif score >= 55:
         grade = "C"
         risk_label = "Moderate"
-        limit = 12000
-    elif score >= 35:
+        limit = min(credit_limit_value or 12000, max(12000.0, credit_rating_value or 12000.0))
+    elif score >= 40:
         grade = "D"
         risk_label = "Moderate to High"
-        limit = 5000
+        limit = min(credit_limit_value or 5000, 5000.0)
     else:
         grade = "E"
         risk_label = "High"
-        limit = 0
+        limit = 0.0
 
     return {
         "available": True,
         "score": score,
         "grade": grade,
         "risk_label": risk_label,
-        "suggested_limit": {
-            "amount": float(limit),
-            "currency": "GBP",
-        },
+        "suggested_limit": money(limit),
         "drivers": drivers,
         "caps_applied": caps_applied,
         "warnings": warnings,
@@ -590,9 +1288,9 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
 def calibrate(experian: Dict[str, Any], internal_model: Dict[str, Any]) -> Dict[str, Any]:
     exp_score = safe_int(experian.get("score"))
     int_score = safe_int(internal_model.get("score"))
-
-    exp_limit = safe_float((experian.get("credit_limit") or {}).get("amount"))
-    int_limit = safe_float((internal_model.get("suggested_limit") or {}).get("amount"))
+    exp_limit = safe_float(get_in(experian, "credit_limit", "amount"))
+    int_limit = safe_float(get_in(internal_model, "suggested_limit", "amount"))
+    exp_credit_rating = safe_float(get_in(experian, "credit_rating", "amount"))
 
     if exp_score is None:
         return {
@@ -613,6 +1311,10 @@ def calibrate(experian: Dict[str, Any], internal_model: Dict[str, Any]) -> Dict[
                 "Experian data unavailable",
                 "Internal model retained as primary fallback",
             ],
+            "observations": {
+                "credit_rating": None,
+                "delphi_band": None,
+            }
         }
 
     score_delta = exp_score - (int_score or 0)
@@ -641,6 +1343,9 @@ def calibrate(experian: Dict[str, Any], internal_model: Dict[str, Any]) -> Dict[
     else:
         reasoning.append("Independent models point in a similar direction")
 
+    if exp_credit_rating is not None:
+        reasoning.append(f"Experian credit rating is £{int(exp_credit_rating):,}")
+
     return {
         "status": status,
         "difference_summary": summary,
@@ -656,6 +1361,10 @@ def calibrate(experian: Dict[str, Any], internal_model: Dict[str, Any]) -> Dict[
         },
         "decision_bias": bias,
         "reasoning": reasoning,
+        "observations": {
+            "credit_rating": exp_credit_rating,
+            "delphi_band": get_in(experian, "commercial_delphi", "band"),
+        }
     }
 
 
@@ -668,8 +1377,60 @@ def build_final_decision(
     warnings: List[str] = []
     rationale: List[str] = []
 
+    profile = companies_house.get("company_profile") or {}
+    status = str(profile.get("company_status", "")).lower().strip()
+
+    # Hard stop: dissolved
+    if status == "dissolved":
+        return {
+            "risk_rating": "High",
+            "credit_stance": "Decline",
+            "suggested_limit": money(0.0),
+            "confidence": "high",
+            "rationale": [
+                "Company is dissolved and no longer trading",
+                "Credit exposure cannot be supported"
+            ],
+            "warnings": ["Company dissolved"]
+        }
+
+    payment = experian.get("payment_behaviour") or {}
+    legal = experian.get("legal") or {}
     exp_score = safe_int(experian.get("score"))
     int_score = safe_int(internal_model.get("score")) or 0
+    exp_credit_limit = safe_float(get_in(experian, "credit_limit", "amount")) or 0.0
+    exp_credit_rating = safe_float(get_in(experian, "credit_rating", "amount")) or 0.0
+    outstanding_charges = safe_int(get_in(experian, "charges_summary", "outstanding_count")) or 0
+    delphi_band = get_in(experian, "commercial_delphi", "band")
+
+    # Hard stop: insolvency
+    if payment.get("insolvency_flag"):
+        return {
+            "risk_rating": "High",
+            "credit_stance": "Decline",
+            "suggested_limit": money(0.0),
+            "confidence": "high",
+            "rationale": [
+                "Insolvency indicator present in bureau/legal data",
+                "Credit exposure cannot be supported"
+            ],
+            "warnings": ["Insolvency indicator present"]
+        }
+
+    # Hard stop / near hard stop: multiple CCJs
+    ccj_count = safe_int(legal.get("ccj_count_last_2y"))
+    if ccj_count is not None and ccj_count >= 2:
+        return {
+            "risk_rating": "High",
+            "credit_stance": "Decline",
+            "suggested_limit": money(0.0),
+            "confidence": "high",
+            "rationale": [
+                "Multiple CCJs recorded in recent legal history",
+                "External legal risk is too high for normal credit terms"
+            ],
+            "warnings": ["Multiple recent CCJs"]
+        }
 
     if exp_score is None:
         final_score = int_score
@@ -680,7 +1441,7 @@ def build_final_decision(
             final_score = round((exp_score + int_score) / 2)
             rationale.append("Experian and internal model are aligned")
         elif bias == "conservative_middle":
-            final_score = round((exp_score * 0.4) + (int_score * 0.6))
+            final_score = round((exp_score * 0.45) + (int_score * 0.55))
             rationale.append("Experian is stronger, but conservative weighting retained")
         elif bias == "experian_weighted":
             final_score = round((exp_score * 0.7) + (int_score * 0.3))
@@ -689,68 +1450,62 @@ def build_final_decision(
             final_score = int_score
             rationale.append("Fallback internal model weighting used")
 
-    charges = companies_house.get("charges") or []
-    if len(charges) > 0:
-        warnings.append("Charge history present")
-        rationale.append("Charge history moderates lending appetite")
+    if outstanding_charges > 0:
+        warnings.append("Outstanding charge history present")
+        rationale.append("Outstanding charge history moderates lending appetite")
 
-    payment = experian.get("payment_behaviour") or {}
-    if payment.get("ccj_flag"):
-        warnings.append("Adverse payment/legal indicator present")
-        rationale.append("Adverse payment marker reduces confidence")
+    if ccj_count and ccj_count > 0:
+        warnings.append("Recent CCJ history present")
+        rationale.append("Recent legal history reduces confidence")
 
-    group_links = experian.get("group_links") or {}
-    if group_links.get("is_group_member"):
+    if safe_bool(get_in(experian, "corporate_structure", "is_group_member")):
         warnings.append("Group linkage identified but support not assumed")
         rationale.append("Group structure may help resilience, but support is not relied upon")
 
-    if final_score >= 80:
+    alerts_count = safe_int(get_in(experian, "alerts", "count"))
+    if alerts_count and alerts_count > 0:
+        warnings.append(f"{alerts_count} bureau alert(s) present")
+        rationale.append("Bureau alerts should be considered alongside the financial stance")
+
+    if delphi_band:
+        rationale.append(f"Delphi band: {delphi_band}")
+
+    if final_score >= 85:
         risk_rating = "Low"
         credit_stance = "Approve"
-        suggested_limit = max(
-            safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 0,
-            safe_float((experian.get("credit_limit") or {}).get("amount")) or 0,
-        )
+        suggested_limit = max(exp_credit_limit, exp_credit_rating)
         confidence = "high" if experian.get("available") else "medium"
-    elif final_score >= 65:
+    elif final_score >= 70:
         risk_rating = "Low to Moderate"
         credit_stance = "Approve with normal controls"
-        suggested_limit = min(
-            max(safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 0, 15000),
-            safe_float((experian.get("credit_limit") or {}).get("amount")) or 25000,
-        ) if experian.get("available") else (safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 15000)
+        suggested_limit = min(exp_credit_limit or 25000.0, max(exp_credit_rating or 25000.0, 25000.0)) if experian.get("available") else 25000.0
         confidence = "medium"
-    elif final_score >= 50:
+    elif final_score >= 55:
         risk_rating = "Moderate"
         credit_stance = "Approve with caution"
-        exp_limit = safe_float((experian.get("credit_limit") or {}).get("amount")) or 0
-        int_limit = safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 0
-        if exp_limit > 0 and int_limit > 0:
-            suggested_limit = min(exp_limit, round((exp_limit + int_limit) / 2))
+        if exp_credit_limit > 0 and exp_credit_rating > 0:
+            suggested_limit = min(exp_credit_limit, max(exp_credit_rating, 10000.0))
         else:
-            suggested_limit = int_limit or exp_limit or 10000
+            suggested_limit = 10000.0
         confidence = "medium"
-    elif final_score >= 35:
+    elif final_score >= 40:
         risk_rating = "Moderate to High"
         credit_stance = "Restricted terms / reduced limit"
-        suggested_limit = min(
-            safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 5000,
-            safe_float((experian.get("credit_limit") or {}).get("amount")) or 5000,
-        ) if experian.get("available") else (safe_float((internal_model.get("suggested_limit") or {}).get("amount")) or 5000)
+        if exp_credit_rating > 0:
+            suggested_limit = min(5000.0, exp_credit_rating)
+        else:
+            suggested_limit = 5000.0
         confidence = "low"
     else:
         risk_rating = "High"
         credit_stance = "Decline or cash-with-order"
-        suggested_limit = 0
+        suggested_limit = 0.0
         confidence = "low"
 
     return {
         "risk_rating": risk_rating,
         "credit_stance": credit_stance,
-        "suggested_limit": {
-            "amount": float(suggested_limit),
-            "currency": "GBP",
-        },
+        "suggested_limit": money(suggested_limit),
         "confidence": confidence,
         "rationale": rationale,
         "warnings": warnings,
@@ -842,6 +1597,7 @@ def root():
             "OCR / PDF accounts extraction removed from live path",
             "Experian is primary bureau layer",
             "Companies House retained for structural/context data",
+            "Experian payload upgraded with credit rating, Delphi, legal, alerts, and 4Y financials",
             "credit-assessment kept as alias to calibrated decision for compatibility"
         ]
     }
