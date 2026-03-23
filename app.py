@@ -12,7 +12,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 
 # -----------------------------------------------------------------------------
 # Environment / Config
@@ -25,6 +25,8 @@ EXPERIAN_MODE = os.getenv("EXPERIAN_MODE", "mock").strip().lower()  # mock | liv
 EXPERIAN_BASE_URL = os.getenv("EXPERIAN_BASE_URL", "https://sandbox-uk-api.experian.com").strip()
 EXPERIAN_CLIENT_ID = os.getenv("EXPERIAN_CLIENT_ID", "").strip()
 EXPERIAN_CLIENT_SECRET = os.getenv("EXPERIAN_CLIENT_SECRET", "").strip()
+EXPERIAN_USERNAME = os.getenv("EXPERIAN_USERNAME", "").strip()
+EXPERIAN_PASSWORD = os.getenv("EXPERIAN_PASSWORD", "").strip()
 
 EXPERIAN_TOKEN_PATH = os.getenv("EXPERIAN_TOKEN_PATH", "/oauth2/v1/token").strip()
 EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/businesses/v1/search").strip()
@@ -200,7 +202,7 @@ def experian_session(token: Optional[str] = None) -> requests.Session:
     return s
 
 
-def experian_get_token():
+def experian_get_token() -> str:
     if not EXPERIAN_CLIENT_ID or not EXPERIAN_CLIENT_SECRET:
         raise HTTPException(500, "Missing Experian client credentials")
 
@@ -223,7 +225,6 @@ def experian_get_token():
         "User-Agent": f"rix-credit-api/{APP_VERSION}",
     }
 
-    # 🔴 THIS IS THE KEY FIX
     r = requests.post(url, json=payload, headers=headers, timeout=EXPERIAN_TIMEOUT)
 
     if not r.ok:
@@ -240,29 +241,6 @@ def experian_get_token():
             502,
             f"Experian token response missing access_token: {data}"
         )
-
-    return token -> str:
-    if not EXPERIAN_CLIENT_ID or not EXPERIAN_CLIENT_SECRET:
-        raise HTTPException(500, "Experian credentials missing")
-
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_TOKEN_PATH}"
-
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": EXPERIAN_CLIENT_ID,
-        "client_secret": EXPERIAN_CLIENT_SECRET,
-    }
-
-    with experian_session() as s:
-        r = s.post(url, data=payload, timeout=EXPERIAN_TIMEOUT)
-
-    if not r.ok:
-        raise HTTPException(502, f"Experian token error: {r.status_code} {r.text[:500]}")
-
-    data = r.json()
-    token = data.get("access_token")
-    if not token:
-        raise HTTPException(502, "Experian token response did not include access_token")
 
     return token
 
@@ -1495,9 +1473,6 @@ def build_final_decision(
     warnings: List[str] = []
     rationale: List[str] = []
 
-    profile = companies_house.get("company_profile") or {}
-    status = str(profile.get("company_status", "")).lower().strip()
-
     payment = experian.get("payment_behaviour") or {}
     legal = experian.get("legal") or {}
     exp_score = safe_int(experian.get("score"))
@@ -1597,7 +1572,6 @@ def build_final_decision(
 
     bias = calibration.get("decision_bias")
 
-    # Raw stance/limit before policy cap
     if final_score >= 85:
         risk_rating = "Low"
         credit_stance = "Approve"
@@ -1647,7 +1621,6 @@ def build_final_decision(
         suggested_limit = 0.0
         confidence = "low"
 
-    # Policy stance cap
     max_stance = policy["max_stance_after_policy"]
     stance_rank = {
         "Approve": 4,
@@ -1661,18 +1634,13 @@ def build_final_decision(
         rationale.append(f"Policy cap applied: stance limited to '{max_stance}'")
         credit_stance = max_stance
 
-    # Policy limit cap
     if suggested_limit > policy["max_limit_after_policy"]:
         rationale.append(
             f"Policy cap applied: limit reduced from £{int(round(suggested_limit)):,} to £{int(round(policy['max_limit_after_policy'])):,}"
         )
         suggested_limit = policy["max_limit_after_policy"]
 
-    # Confidence adjustment
     if no_payment_data and confidence == "high":
-        confidence = "medium"
-
-    if "weak_liquidity" in policy["caution_flags"] and confidence == "medium":
         confidence = "medium"
 
     return {
@@ -1796,6 +1764,8 @@ def debug_env():
         "ch_api_key_set": bool(CH_API_KEY),
         "experian_client_id_set": bool(EXPERIAN_CLIENT_ID),
         "experian_client_secret_set": bool(EXPERIAN_CLIENT_SECRET),
+        "experian_username_set": bool(EXPERIAN_USERNAME),
+        "experian_password_set": bool(EXPERIAN_PASSWORD),
         "experian_base_url": EXPERIAN_BASE_URL,
     }
 
