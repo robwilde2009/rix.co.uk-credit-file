@@ -12,7 +12,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 
 # -----------------------------------------------------------------------------
 # Environment / Config
@@ -26,7 +26,6 @@ EXPERIAN_BASE_URL = os.getenv("EXPERIAN_BASE_URL", "https://sandbox-uk-api.exper
 EXPERIAN_CLIENT_ID = os.getenv("EXPERIAN_CLIENT_ID", "").strip()
 EXPERIAN_CLIENT_SECRET = os.getenv("EXPERIAN_CLIENT_SECRET", "").strip()
 
-# Placeholder paths until exact Experian docs / payloads are confirmed
 EXPERIAN_TOKEN_PATH = os.getenv("EXPERIAN_TOKEN_PATH", "/oauth2/v1/token").strip()
 EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/businesses/v1/search").strip()
 EXPERIAN_REPORT_PATH_TEMPLATE = os.getenv(
@@ -111,6 +110,10 @@ def get_in(obj: Any, *path: str) -> Any:
             return None
         cur = cur.get(part)
     return cur
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
 # -----------------------------------------------------------------------------
@@ -395,8 +398,6 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
         "reference": f"EXP-{company_number}",
         "report_date": now_utc_iso()[:10],
         "matched_company_name": matched_name,
-
-        # shortcut fields for simple scoring logic
         "score": delphi_score,
         "score_description": delphi_band,
         "risk_band": delphi_band,
@@ -411,17 +412,13 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
             "ccj_flag": ccj_count > 0,
             "insolvency_flag": False,
         },
-
-        # richer structure
         "opinion": {
             "summary": "A very low risk company; credit may be considered comfortably within the recommended rating and with caution around structural encumbrances."
         },
-
         "credit_values": {
             "credit_limit": money(credit_limit_value),
             "credit_rating": money(credit_rating_value),
         },
-
         "commercial_delphi": {
             "score": delphi_score,
             "band": delphi_band,
@@ -456,7 +453,6 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
                 }
             }
         },
-
         "payment_profile": {
             "company_payment_data_available": company_payment_data_available,
             "company_dbt": company_dbt,
@@ -474,14 +470,12 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
             },
             "trend": "unknown"
         },
-
         "legal": {
             "ccj_count_last_2y": ccj_count,
             "ccj_flag": ccj_count > 0,
             "most_recent_legal_notices_text": "No Legal Notices Recorded",
             "legal_notices_count": 0
         },
-
         "alerts": {
             "count": 1,
             "items": [
@@ -491,7 +485,6 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
                 }
             ]
         },
-
         "financials": {
             "currency": "GBP",
             "latest_accounts_date": history_4y[0]["date"],
@@ -518,22 +511,18 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
             "cash_flow_available": False,
             "profit_loss_available": False,
         },
-
         "directors_summary": {
             "current_directors_count": 2,
             "current_directors_may_also_be_shareholders": 2
         },
-
         "corporate_structure": {
             "is_group_member": False,
             "summary": "This company is not part of a group"
         },
-
         "charges_summary": {
             "outstanding_count": outstanding_charges,
             "satisfied_count": satisfied_charges
         },
-
         "warnings": [],
         "raw": {
             "mode": "mock",
@@ -547,11 +536,6 @@ def map_experian_live_payload(
     business_id: Optional[str] = None,
     matched_company_name: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Provider-tolerant mapping. Tighten once actual Commercial Credit sandbox
-    response fields are confirmed.
-    """
-
     delphi_src = get_first(
         raw_report.get("commercial_delphi"),
         raw_report.get("commercialDelphi"),
@@ -775,8 +759,6 @@ def map_experian_live_payload(
         "reference": get_first(raw_report.get("reference"), raw_report.get("reportId"), business_id),
         "report_date": get_first(raw_report.get("report_date"), raw_report.get("reportDate"), now_utc_iso()[:10]),
         "matched_company_name": effective_matched_name,
-
-        # simple top-level shortcuts
         "score": delphi_score,
         "score_description": delphi_band,
         "risk_band": delphi_band,
@@ -791,17 +773,13 @@ def map_experian_live_payload(
             "ccj_flag": (ccj_count_last_2y or 0) > 0,
             "insolvency_flag": bool(insolvency_flag),
         },
-
-        # richer structure
         "opinion": {
             "summary": get_first(opinion_src.get("summary"), raw_report.get("credit_opinion"), raw_report.get("creditOpinion"))
         },
-
         "credit_values": {
             "credit_limit": money(credit_limit_value),
             "credit_rating": money(credit_rating_value),
         },
-
         "commercial_delphi": {
             "score": delphi_score,
             "band": delphi_band,
@@ -832,7 +810,6 @@ def map_experian_live_payload(
                 {}
             ) or {}
         },
-
         "payment_profile": {
             "company_payment_data_available": company_payment_data_available,
             "company_dbt": company_dbt,
@@ -891,7 +868,6 @@ def map_experian_live_payload(
             },
             "trend": get_first(payment_src.get("trend"), payment_src.get("payment_trend"), raw_report.get("payment_trend")),
         },
-
         "legal": {
             "ccj_count_last_2y": ccj_count_last_2y,
             "ccj_flag": (ccj_count_last_2y or 0) > 0,
@@ -908,12 +884,10 @@ def map_experian_live_payload(
                 raw_report.get("legalNoticesCount")
             ))
         },
-
         "alerts": {
             "count": alerts_count,
             "items": alerts_items if isinstance(alerts_items, list) else []
         },
-
         "financials": {
             "currency": get_first(financials_src.get("currency"), raw_report.get("financial_currency"), "GBP"),
             "latest_accounts_date": get_first(
@@ -950,7 +924,6 @@ def map_experian_live_payload(
                 raw_report.get("profitLossAvailable")
             )),
         },
-
         "directors_summary": {
             "current_directors_count": safe_int(get_first(
                 directors_src.get("current_directors_count"),
@@ -965,7 +938,6 @@ def map_experian_live_payload(
                 raw_report.get("currentDirectorsMayAlsoBeShareholders")
             )),
         },
-
         "corporate_structure": {
             "is_group_member": corporate_is_group_member,
             "summary": get_first(
@@ -976,7 +948,6 @@ def map_experian_live_payload(
                 raw_report.get("corporate_structure_summary")
             )
         },
-
         "charges_summary": {
             "outstanding_count": safe_int(get_first(
                 charges_src.get("outstanding_count"),
@@ -991,7 +962,6 @@ def map_experian_live_payload(
                 raw_report.get("satisfiedChargesCount")
             ))
         },
-
         "warnings": [],
         "raw": raw_report,
     }
@@ -1385,6 +1355,96 @@ def calibrate(experian: Dict[str, Any], internal_model: Dict[str, Any]) -> Dict[
     }
 
 
+# -----------------------------------------------------------------------------
+# Policy layer
+# -----------------------------------------------------------------------------
+
+def build_policy_overrides(
+    companies_house: Dict[str, Any],
+    experian: Dict[str, Any],
+    internal_model: Dict[str, Any],
+    calibration: Dict[str, Any]
+) -> Dict[str, Any]:
+    profile = companies_house.get("company_profile") or {}
+    payment = experian.get("payment_behaviour") or {}
+    legal = experian.get("legal") or {}
+    ratios = get_in(experian, "financials", "ratios", "latest") or {}
+
+    company_status = str(profile.get("company_status", "")).lower().strip()
+    charge_count = safe_int(get_in(experian, "charges_summary", "outstanding_count"))
+    if charge_count is None:
+        charge_count = len([c for c in companies_house.get("charges", []) if str(c.get("status", "")).lower() == "outstanding"])
+
+    ccj_count = safe_int(legal.get("ccj_count_last_2y")) or 0
+    no_payment_data = safe_bool(payment.get("company_payment_data_available")) is False
+    insolvency_flag = safe_bool(payment.get("insolvency_flag")) is True
+    current_ratio = safe_float(ratios.get("current_ratio"))
+    gearing_pct = safe_float(ratios.get("gearing_pct"))
+    delphi_score = safe_int(experian.get("score")) or 0
+    credit_rating = safe_float(get_in(experian, "credit_rating", "amount")) or 0.0
+    credit_limit = safe_float(get_in(experian, "credit_limit", "amount")) or 0.0
+
+    hard_stop = None
+    if company_status == "dissolved":
+        hard_stop = "dissolved_company"
+    elif insolvency_flag:
+        hard_stop = "insolvency_indicator"
+    elif ccj_count >= 2:
+        hard_stop = "multiple_ccjs"
+
+    caution_flags: List[str] = []
+    if charge_count > 0:
+        caution_flags.append("outstanding_charges")
+    if no_payment_data:
+        caution_flags.append("no_company_payment_data")
+    if current_ratio is not None and current_ratio < 1.0:
+        caution_flags.append("weak_liquidity")
+    if gearing_pct is not None and gearing_pct >= 150:
+        caution_flags.append("high_gearing")
+    if ccj_count == 1:
+        caution_flags.append("single_ccj")
+
+    if hard_stop:
+        max_limit = 0.0
+        max_uplift_pct_of_credit_rating = 0.0
+        max_stance = "Decline"
+    else:
+        if caution_flags:
+            if "outstanding_charges" in caution_flags or "no_company_payment_data" in caution_flags:
+                max_uplift_pct_of_credit_rating = 1.00
+            else:
+                max_uplift_pct_of_credit_rating = 1.25
+        else:
+            if delphi_score >= 90:
+                max_uplift_pct_of_credit_rating = 1.50
+            elif delphi_score >= 80:
+                max_uplift_pct_of_credit_rating = 1.35
+            else:
+                max_uplift_pct_of_credit_rating = 1.25
+
+        if credit_rating > 0:
+            max_limit = min(credit_limit or credit_rating, credit_rating * max_uplift_pct_of_credit_rating)
+        else:
+            max_limit = credit_limit
+
+        if caution_flags:
+            max_stance = "Approve with normal controls"
+        else:
+            max_stance = "Approve"
+
+    return {
+        "hard_stop": hard_stop,
+        "caution_flags": caution_flags,
+        "max_uplift_pct_of_credit_rating": max_uplift_pct_of_credit_rating,
+        "max_limit_after_policy": round(float(max_limit), 2),
+        "max_stance_after_policy": max_stance,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Final decision
+# -----------------------------------------------------------------------------
+
 def build_final_decision(
     companies_house: Dict[str, Any],
     experian: Dict[str, Any],
@@ -1397,8 +1457,20 @@ def build_final_decision(
     profile = companies_house.get("company_profile") or {}
     status = str(profile.get("company_status", "")).lower().strip()
 
-    # Hard stop: dissolved
-    if status == "dissolved":
+    payment = experian.get("payment_behaviour") or {}
+    legal = experian.get("legal") or {}
+    exp_score = safe_int(experian.get("score"))
+    int_score = safe_int(internal_model.get("score")) or 0
+    exp_credit_limit = safe_float(get_in(experian, "credit_limit", "amount")) or 0.0
+    exp_credit_rating = safe_float(get_in(experian, "credit_rating", "amount")) or 0.0
+    outstanding_charges = safe_int(get_in(experian, "charges_summary", "outstanding_count")) or 0
+    delphi_band = get_in(experian, "commercial_delphi", "band")
+    ccj_count = safe_int(legal.get("ccj_count_last_2y")) or 0
+    no_payment_data = safe_bool(payment.get("company_payment_data_available")) is False
+
+    policy = build_policy_overrides(companies_house, experian, internal_model, calibration)
+
+    if policy["hard_stop"] == "dissolved_company":
         return {
             "risk_rating": "High",
             "credit_stance": "Decline",
@@ -1408,21 +1480,11 @@ def build_final_decision(
                 "Company is dissolved and no longer trading",
                 "Credit exposure cannot be supported"
             ],
-            "warnings": ["Company dissolved"]
+            "warnings": ["Company dissolved"],
+            "policy_overrides": policy,
         }
 
-    payment = experian.get("payment_behaviour") or {}
-    legal = experian.get("legal") or {}
-    exp_score = safe_int(experian.get("score"))
-    int_score = safe_int(internal_model.get("score")) or 0
-    exp_credit_limit = safe_float(get_in(experian, "credit_limit", "amount")) or 0.0
-    exp_credit_rating = safe_float(get_in(experian, "credit_rating", "amount")) or 0.0
-    outstanding_charges = safe_int(get_in(experian, "charges_summary", "outstanding_count")) or 0
-    delphi_band = get_in(experian, "commercial_delphi", "band")
-    charge_caution = outstanding_charges > 0
-
-    # Hard stop: insolvency
-    if payment.get("insolvency_flag"):
+    if policy["hard_stop"] == "insolvency_indicator":
         return {
             "risk_rating": "High",
             "credit_stance": "Decline",
@@ -1432,12 +1494,11 @@ def build_final_decision(
                 "Insolvency indicator present in bureau/legal data",
                 "Credit exposure cannot be supported"
             ],
-            "warnings": ["Insolvency indicator present"]
+            "warnings": ["Insolvency indicator present"],
+            "policy_overrides": policy,
         }
 
-    # Hard stop / near hard stop: multiple CCJs
-    ccj_count = safe_int(legal.get("ccj_count_last_2y"))
-    if ccj_count is not None and ccj_count >= 2:
+    if policy["hard_stop"] == "multiple_ccjs":
         return {
             "risk_rating": "High",
             "credit_stance": "Decline",
@@ -1447,7 +1508,8 @@ def build_final_decision(
                 "Multiple CCJs recorded in recent legal history",
                 "External legal risk is too high for normal credit terms"
             ],
-            "warnings": ["Multiple recent CCJs"]
+            "warnings": ["Multiple recent CCJs"],
+            "policy_overrides": policy,
         }
 
     if exp_score is None:
@@ -1472,7 +1534,7 @@ def build_final_decision(
         warnings.append("Outstanding charge history present")
         rationale.append("Outstanding charge history moderates lending appetite")
 
-    if ccj_count and ccj_count > 0:
+    if ccj_count > 0:
         warnings.append("Recent CCJ history present")
         rationale.append("Recent legal history reduces confidence")
 
@@ -1485,7 +1547,7 @@ def build_final_decision(
         warnings.append(f"{alerts_count} bureau alert(s) present")
         rationale.append("Bureau alerts should be considered alongside the financial stance")
 
-    if safe_bool(payment.get("company_payment_data_available")) is False:
+    if no_payment_data:
         warnings.append("No company payment data available")
         rationale.append("No company payment data is available, so limit confidence is reduced")
 
@@ -1494,14 +1556,15 @@ def build_final_decision(
 
     bias = calibration.get("decision_bias")
 
+    # Raw stance/limit before policy cap
     if final_score >= 85:
         risk_rating = "Low"
         credit_stance = "Approve"
         if bias == "conservative_middle":
-            suggested_limit = min(
-                exp_credit_limit or exp_credit_rating or 50000.0,
-                max(exp_credit_rating or 0.0, round((exp_credit_limit + exp_credit_rating) / 2)) if exp_credit_limit and exp_credit_rating else (exp_credit_rating or exp_credit_limit or 50000.0)
-            )
+            if exp_credit_rating > 0:
+                suggested_limit = exp_credit_rating
+            else:
+                suggested_limit = exp_credit_limit * 0.4 if exp_credit_limit > 0 else 50000.0
             confidence = "medium"
         else:
             suggested_limit = max(exp_credit_limit, exp_credit_rating, 0.0)
@@ -1534,10 +1597,7 @@ def build_final_decision(
     elif final_score >= 40:
         risk_rating = "Moderate to High"
         credit_stance = "Restricted terms / reduced limit"
-        suggested_limit = min(
-            5000.0,
-            exp_credit_rating or 5000.0
-        )
+        suggested_limit = min(5000.0, exp_credit_rating or 5000.0)
         confidence = "low"
 
     else:
@@ -1546,21 +1606,33 @@ def build_final_decision(
         suggested_limit = 0.0
         confidence = "low"
 
-    # Post-adjustments for structural caution
-    if charge_caution and credit_stance == "Approve":
-        credit_stance = "Approve with normal controls"
+    # Policy stance cap
+    max_stance = policy["max_stance_after_policy"]
+    stance_rank = {
+        "Approve": 4,
+        "Approve with normal controls": 3,
+        "Approve with caution": 2,
+        "Restricted terms / reduced limit": 1,
+        "Decline": 0,
+        "Decline or cash-with-order": 0,
+    }
+    if stance_rank.get(credit_stance, 0) > stance_rank.get(max_stance, 0):
+        rationale.append(f"Policy cap applied: stance limited to '{max_stance}'")
+        credit_stance = max_stance
+
+    # Policy limit cap
+    if suggested_limit > policy["max_limit_after_policy"]:
+        rationale.append(
+            f"Policy cap applied: limit reduced from £{int(round(suggested_limit)):,} to £{int(round(policy['max_limit_after_policy'])):,}"
+        )
+        suggested_limit = policy["max_limit_after_policy"]
+
+    # Confidence adjustment
+    if no_payment_data and confidence == "high":
         confidence = "medium"
 
-    if safe_bool(payment.get("company_payment_data_available")) is False and confidence == "high":
+    if "weak_liquidity" in policy["caution_flags"] and confidence == "medium":
         confidence = "medium"
-
-    # Keep limit anchored to credit rating where caution exists
-    if bias == "conservative_middle":
-        if exp_credit_rating > 0:
-            suggested_limit = min(float(suggested_limit), max(exp_credit_rating, float(suggested_limit)))
-            # stronger cap when there is structural caution
-            if charge_caution or safe_bool(payment.get("company_payment_data_available")) is False:
-                suggested_limit = min(float(suggested_limit), max(exp_credit_rating, round((exp_credit_limit + exp_credit_rating) / 2)) if exp_credit_limit > 0 else exp_credit_rating)
 
     return {
         "risk_rating": risk_rating,
@@ -1569,6 +1641,7 @@ def build_final_decision(
         "confidence": confidence,
         "rationale": rationale,
         "warnings": warnings,
+        "policy_overrides": policy,
     }
 
 
@@ -1658,6 +1731,7 @@ def root():
             "Experian is primary bureau layer",
             "Companies House retained for structural/context data",
             "Experian payload upgraded with credit rating, Delphi, legal, alerts, and 4Y financials",
+            "Policy overrides applied to final stance and limit",
             "credit-assessment kept as alias to calibrated decision for compatibility"
         ]
     }
@@ -1731,8 +1805,4 @@ def credit_assessment(
     company_number: str,
     company_name: Optional[str] = Query(default=None)
 ):
-    """
-    Compatibility alias. Previously this endpoint used OCR + extracted accounts.
-    It now returns the Experian-first calibrated decision.
-    """
     return build_credit_decision(company_number, company_name)
