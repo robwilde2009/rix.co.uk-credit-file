@@ -22,7 +22,10 @@ CH_API_KEY = os.getenv("CH_API_KEY", "").strip()
 CH_API_BASE = "https://api.company-information.service.gov.uk"
 
 EXPERIAN_MODE = os.getenv("EXPERIAN_MODE", "mock").strip().lower()  # mock | live
-EXPERIAN_BASE_URL = os.getenv("EXPERIAN_BASE_URL", "https://sandbox-uk-api.experian.com").strip()
+EXPERIAN_BASE_URL = os.getenv(
+    "EXPERIAN_BASE_URL",
+    "https://sandbox-uk-api.experian.com"
+).strip()
 EXPERIAN_CLIENT_ID = os.getenv("EXPERIAN_CLIENT_ID", "").strip()
 EXPERIAN_CLIENT_SECRET = os.getenv("EXPERIAN_CLIENT_SECRET", "").strip()
 EXPERIAN_USERNAME = os.getenv("EXPERIAN_USERNAME", "").strip()
@@ -251,15 +254,11 @@ def experian_search_company_live(
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
 
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesstargeter"
 
     params = {
-        "country": "GB",
-        "searchId": company_number  # THIS is the key field
+        "businessref": company_number  # THIS is the correct field
     }
-
-    if company_name:
-        params["name"] = company_name
 
     with experian_session(token) as s:
         r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
@@ -296,9 +295,8 @@ def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str
     return None
 
 
-def experian_get_company_report_live(token: str, business_id: str) -> Dict[str, Any]:
-    path = EXPERIAN_REPORT_PATH_TEMPLATE.format(business_id=business_id)
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{path}"
+def experian_get_company_report_live(token: str, company_number: str) -> Dict[str, Any]:
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit/{company_number}"
 
     with experian_session(token) as s:
         r = s.get(url, timeout=EXPERIAN_TIMEOUT)
@@ -1083,28 +1081,17 @@ def get_experian_report(company_number: str, company_name: Optional[str] = None)
 
     try:
         token = experian_get_token()
-        search_result = experian_search_company_live(token, company_number, company_name)
-        business_id = experian_extract_business_id(search_result)
-
-        if not business_id:
-            return empty_experian_response(
-                source="experian_live",
-                company_name=company_name,
-                warning="Experian search returned no usable business ID",
-                raw={"search_result": search_result}
-            )
-
-        raw_report = experian_get_company_report_live(token, business_id)
-        mapped = map_experian_live_payload(raw_report, business_id=business_id, matched_company_name=company_name)
+        raw_report = experian_get_company_report_live(token, company_number)
+        mapped = map_experian_live_payload(raw_report, business_id=company_number, matched_company_name=company_name)
 
         if not mapped.get("matched_company_name"):
             mapped["matched_company_name"] = company_name
 
         mapped["raw"] = {
-            "search_result": search_result,
             "report_result": raw_report
         }
         return mapped
+        
 
     except Exception as e:
         logger.exception("Experian fetch failed")
