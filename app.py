@@ -250,10 +250,12 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
+
     url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
 
     params = {
-        "businessref": company_number,
+        "country": "GB",
+        "searchId": company_number  # THIS is the key field
     }
 
     if company_name:
