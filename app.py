@@ -3,6 +3,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -12,7 +13,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2-debug-search"
 
 # -----------------------------------------------------------------------------
 # Environment / Config
@@ -32,14 +33,10 @@ EXPERIAN_USERNAME = os.getenv("EXPERIAN_USERNAME", "").strip()
 EXPERIAN_PASSWORD = os.getenv("EXPERIAN_PASSWORD", "").strip()
 
 EXPERIAN_TOKEN_PATH = os.getenv("EXPERIAN_TOKEN_PATH", "/oauth2/v1/token").strip()
-EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/v2/businesssearch").strip()
-EXPERIAN_REPORT_PATH_TEMPLATE = os.getenv(
-    "EXPERIAN_REPORT_PATH_TEMPLATE",
-    "/businessinformation/businesses/v1/{business_id}/report"
-).strip()
+EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/v2/businesstargeter").strip()
 
 HTTP_TIMEOUT = (3.05, 12)
-EXPERIAN_TIMEOUT = (3.05, 10)
+EXPERIAN_TIMEOUT = (3.05, 15)
 
 ALLOW_PARTIAL_RESULTS = os.getenv("ALLOW_PARTIAL_RESULTS", "true").strip().lower() == "true"
 
@@ -115,10 +112,6 @@ def get_in(obj: Any, *path: str) -> Any:
             return None
         cur = cur.get(part)
     return cur
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
 
 
 # -----------------------------------------------------------------------------
@@ -231,21 +224,37 @@ def experian_get_token() -> str:
     r = requests.post(url, json=payload, headers=headers, timeout=EXPERIAN_TIMEOUT)
 
     if not r.ok:
-        raise HTTPException(
-            502,
-            f"Experian token error: {r.status_code} {r.text[:500]}"
-        )
+        raise HTTPException(502, f"Experian token error: {r.status_code} {r.text[:500]}")
 
     data = r.json()
     token = data.get("access_token")
 
     if not token:
-        raise HTTPException(
-            502,
-            f"Experian token response missing access_token: {data}"
-        )
+        raise HTTPException(502, f"Experian token response missing access_token: {data}")
 
     return token
+
+
+def experian_proxy_get(token: str, target_url: str) -> Dict[str, Any]:
+    proxy_url = "https://sandbox-us-api.experian.com/eits/gdp/v1/request"
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": f"rix-credit-api/{APP_VERSION}",
+    }
+
+    r = requests.get(
+        proxy_url,
+        params={"targeturl": target_url},
+        headers=headers,
+        timeout=EXPERIAN_TIMEOUT,
+    )
+
+    if not r.ok:
+        raise HTTPException(502, f"Experian proxy error: {r.status_code} {r.text[:500]}")
+
+    return r.json()
 
 
 def experian_search_company_live(
@@ -253,20 +262,14 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
+    params = {"businessref": company_number}
+    if company_name:
+        params["name"] = company_name
 
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesstargeter"
+    query = urlencode(params)
+    target_url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}?{query}"
 
-    params = {
-        "businessref": company_number  # THIS is the correct field
-    }
-
-    with experian_session(token) as s:
-        r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
-
-    if not r.ok:
-        raise HTTPException(502, f"Experian search error: {r.status_code} {r.text[:500]}")
-
-    return r.json()
+    return experian_proxy_get(token, target_url)
 
 
 def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str]:
@@ -278,45 +281,44 @@ def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str
         search_payload.get("businesses"),
         search_payload.get("items"),
         search_payload.get("data"),
+        search_payload.get("searchResults"),
     ]
 
     for candidate_list in candidate_lists:
         if isinstance(candidate_list, list) and candidate_list:
             first = candidate_list[0]
             if isinstance(first, dict):
-                for key in ["businessId", "business_id", "id", "companyId", "company_id", "reference"]:
+                for key in [
+                    "businessId",
+                    "business_id",
+                    "id",
+                    "companyId",
+                    "company_id",
+                    "reference",
+                    "businessRef",
+                    "businessref",
+                    "regNumber",
+                    "regnumber",
+                ]:
                     if first.get(key):
                         return str(first.get(key))
 
-    for key in ["businessId", "business_id", "id", "companyId", "company_id", "reference"]:
+    for key in [
+        "businessId",
+        "business_id",
+        "id",
+        "companyId",
+        "company_id",
+        "reference",
+        "businessRef",
+        "businessref",
+        "regNumber",
+        "regnumber",
+    ]:
         if search_payload.get(key):
             return str(search_payload.get(key))
 
     return None
-
-
-from urllib.parse import quote
-
-def experian_get_company_report_live(token: str, company_number: str) -> Dict[str, Any]:
-    target_url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit/{company_number}"
-
-    url = f"https://sandbox-us-api.experian.com/eits/gdp/v1/request"
-
-    params = {
-        "targeturl": target_url
-    }
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    r = requests.get(url, params=params, headers=headers, timeout=EXPERIAN_TIMEOUT)
-
-    if not r.ok:
-        raise HTTPException(502, f"Experian report error: {r.status_code} {r.text[:500]}")
-
-    return r.json()
 
 
 def experian_mock_report(company_number: str, company_name: Optional[str] = None) -> Dict[str, Any]:
@@ -562,442 +564,6 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
     }
 
 
-def map_experian_live_payload(
-    raw_report: Dict[str, Any],
-    business_id: Optional[str] = None,
-    matched_company_name: Optional[str] = None
-) -> Dict[str, Any]:
-    delphi_src = get_first(
-        raw_report.get("commercial_delphi"),
-        raw_report.get("commercialDelphi"),
-        raw_report.get("delphi"),
-        {}
-    ) or {}
-
-    payment_src = get_first(
-        raw_report.get("payment_profile"),
-        raw_report.get("paymentProfile"),
-        raw_report.get("payment_behaviour"),
-        raw_report.get("paymentBehaviour"),
-        {}
-    ) or {}
-
-    legal_src = get_first(
-        raw_report.get("legal"),
-        raw_report.get("legalNotices"),
-        raw_report.get("courtInformation"),
-        {}
-    ) or {}
-
-    alerts_src = get_first(
-        raw_report.get("alerts"),
-        raw_report.get("alertsSummary"),
-        {}
-    ) or {}
-
-    financials_src = get_first(
-        raw_report.get("financials"),
-        raw_report.get("financialInformation"),
-        raw_report.get("accounts"),
-        {}
-    ) or {}
-
-    directors_src = get_first(
-        raw_report.get("directors_summary"),
-        raw_report.get("directorsSummary"),
-        {}
-    ) or {}
-
-    corporate_src = get_first(
-        raw_report.get("corporate_structure"),
-        raw_report.get("corporateStructure"),
-        raw_report.get("group_links"),
-        raw_report.get("corporateLinkage"),
-        {}
-    ) or {}
-
-    charges_src = get_first(
-        raw_report.get("charges_summary"),
-        raw_report.get("chargesSummary"),
-        {}
-    ) or {}
-
-    opinion_src = get_first(
-        raw_report.get("opinion"),
-        raw_report.get("creditOpinion"),
-        {}
-    ) or {}
-
-    credit_limit_value = safe_float(
-        get_first(
-            get_in(raw_report, "credit_limit", "amount"),
-            get_in(raw_report, "creditLimit", "amount"),
-            raw_report.get("credit_limit"),
-            raw_report.get("creditLimit"),
-            get_in(raw_report, "credit_values", "credit_limit", "amount"),
-            get_in(raw_report, "creditValues", "creditLimit", "amount"),
-        )
-    )
-
-    credit_rating_value = safe_float(
-        get_first(
-            get_in(raw_report, "credit_rating", "amount"),
-            get_in(raw_report, "creditRating", "amount"),
-            raw_report.get("credit_rating"),
-            raw_report.get("creditRating"),
-            get_in(raw_report, "credit_values", "credit_rating", "amount"),
-            get_in(raw_report, "creditValues", "creditRating", "amount"),
-        )
-    )
-
-    delphi_score = safe_int(
-        get_first(
-            raw_report.get("score"),
-            raw_report.get("commercial_delphi_score"),
-            raw_report.get("commercialDelphiScore"),
-            delphi_src.get("score"),
-            delphi_src.get("commercialDelphiScore"),
-        )
-    )
-
-    delphi_band = get_first(
-        raw_report.get("risk_band"),
-        raw_report.get("commercial_delphi_band"),
-        raw_report.get("commercialDelphiBand"),
-        delphi_src.get("band"),
-        delphi_src.get("riskBand"),
-        delphi_src.get("commercialDelphiBand"),
-    )
-
-    company_dbt = safe_int(
-        get_first(
-            payment_src.get("company_dbt"),
-            payment_src.get("companyDBT"),
-            payment_src.get("average_dbt"),
-            payment_src.get("averageDBT"),
-            raw_report.get("company_dbt"),
-            raw_report.get("companyDBT"),
-        )
-    )
-
-    company_payment_data_available = safe_bool(
-        get_first(
-            payment_src.get("company_payment_data_available"),
-            payment_src.get("companyPaymentDataAvailable"),
-            raw_report.get("company_payment_data_available"),
-            raw_report.get("companyPaymentDataAvailable"),
-        )
-    )
-
-    industry_dbt_current = safe_int(
-        get_first(
-            get_in(payment_src, "industry_dbt", "current"),
-            get_in(payment_src, "industryDBT", "current"),
-            payment_src.get("industry_dbt_current"),
-            payment_src.get("industryDBTCurrent"),
-            raw_report.get("industry_dbt_current"),
-            raw_report.get("industryDBTCurrent"),
-        )
-    )
-
-    ccj_count_last_2y = safe_int(
-        get_first(
-            legal_src.get("ccj_count_last_2y"),
-            legal_src.get("ccjCountLast2Y"),
-            legal_src.get("ccj_count"),
-            raw_report.get("ccj_count_last_2y"),
-            raw_report.get("ccjCountLast2Y"),
-        )
-    )
-
-    insolvency_flag = safe_bool(
-        get_first(
-            legal_src.get("insolvency_flag"),
-            legal_src.get("insolvencyFlag"),
-            raw_report.get("insolvency_flag"),
-            raw_report.get("insolvencyFlag"),
-        )
-    )
-    if insolvency_flag is None:
-        insolvency_count = safe_int(get_first(
-            legal_src.get("insolvency_count"),
-            legal_src.get("insolvencyCount"),
-            raw_report.get("insolvency_count"),
-            raw_report.get("insolvencyCount"),
-        ))
-        insolvency_flag = False if insolvency_count in (None, 0) else True
-
-    summary_latest = get_first(
-        financials_src.get("summary_latest"),
-        financials_src.get("summaryLatest"),
-        raw_report.get("financial_summary_latest"),
-        raw_report.get("financialSummaryLatest"),
-        {}
-    ) or {}
-
-    history_4y = get_first(
-        financials_src.get("history_4y"),
-        financials_src.get("history4y"),
-        raw_report.get("financial_history_4y"),
-        raw_report.get("financialHistory4Y"),
-        []
-    ) or []
-
-    ratios = get_first(
-        financials_src.get("ratios"),
-        raw_report.get("financial_ratios"),
-        raw_report.get("financialRatios"),
-        {}
-    ) or {}
-
-    alerts_items = get_first(
-        alerts_src.get("items"),
-        alerts_src.get("alerts"),
-        raw_report.get("alerts"),
-        []
-    ) or []
-
-    alerts_count = safe_int(
-        get_first(
-            alerts_src.get("count"),
-            alerts_src.get("alerts_count"),
-            raw_report.get("alerts_count"),
-            raw_report.get("alertsCount"),
-            len(alerts_items) if isinstance(alerts_items, list) else None,
-        )
-    )
-
-    corporate_is_group_member = safe_bool(
-        get_first(
-            corporate_src.get("is_group_member"),
-            corporate_src.get("isGroupMember"),
-            raw_report.get("is_group_member"),
-            raw_report.get("isGroupMember"),
-        )
-    )
-
-    effective_matched_name = get_first(
-        matched_company_name,
-        raw_report.get("matched_company_name"),
-        raw_report.get("matchedCompanyName"),
-        get_in(raw_report, "business", "name"),
-        get_in(raw_report, "company", "name"),
-    )
-
-    return {
-        "available": True,
-        "source": "experian_live",
-        "reference": get_first(raw_report.get("reference"), raw_report.get("reportId"), business_id),
-        "report_date": get_first(raw_report.get("report_date"), raw_report.get("reportDate"), now_utc_iso()[:10]),
-        "matched_company_name": effective_matched_name,
-        "score": delphi_score,
-        "score_description": delphi_band,
-        "risk_band": delphi_band,
-        "credit_limit": money(credit_limit_value),
-        "credit_rating": money(credit_rating_value),
-        "ccj_count_last_2y": ccj_count_last_2y,
-        "payment_behaviour": {
-            "average_dbt": company_dbt,
-            "company_payment_data_available": company_payment_data_available,
-            "industry_dbt_current": industry_dbt_current,
-            "ccj_count_last_2y": ccj_count_last_2y,
-            "ccj_flag": (ccj_count_last_2y or 0) > 0,
-            "insolvency_flag": bool(insolvency_flag),
-        },
-        "opinion": {
-            "summary": get_first(opinion_src.get("summary"), raw_report.get("credit_opinion"), raw_report.get("creditOpinion"))
-        },
-        "credit_values": {
-            "credit_limit": money(credit_limit_value),
-            "credit_rating": money(credit_rating_value),
-        },
-        "commercial_delphi": {
-            "score": delphi_score,
-            "band": delphi_band,
-            "failure_odds": get_first(
-                delphi_src.get("failure_odds"),
-                delphi_src.get("failureOdds"),
-                raw_report.get("failure_odds"),
-                raw_report.get("failureOdds")
-            ),
-            "calculated_at": get_first(
-                delphi_src.get("calculated_at"),
-                delphi_src.get("calculatedAt"),
-                raw_report.get("delphi_calculated_at"),
-                raw_report.get("delphiCalculatedAt")
-            ),
-            "history_12m": get_first(
-                delphi_src.get("history_12m"),
-                delphi_src.get("history12m"),
-                raw_report.get("commercial_delphi_history_12m"),
-                raw_report.get("commercialDelphiHistory12M"),
-                []
-            ) or [],
-            "sector_comparisons": get_first(
-                delphi_src.get("sector_comparisons"),
-                delphi_src.get("sectorComparisons"),
-                raw_report.get("sector_comparisons"),
-                raw_report.get("sectorComparisons"),
-                {}
-            ) or {}
-        },
-        "payment_profile": {
-            "company_payment_data_available": company_payment_data_available,
-            "company_dbt": company_dbt,
-            "company_dbt_text": get_first(
-                payment_src.get("company_dbt_text"),
-                payment_src.get("companyDBTText"),
-                raw_report.get("company_dbt_text"),
-                raw_report.get("companyDBTText")
-            ),
-            "industry_dbt": {
-                "current": industry_dbt_current,
-                "last_3m": safe_int(get_first(
-                    get_in(payment_src, "industry_dbt", "last_3m"),
-                    get_in(payment_src, "industryDBT", "last3m"),
-                    payment_src.get("industry_dbt_last_3m"),
-                    payment_src.get("industryDBTLast3M"),
-                    raw_report.get("industry_dbt_last_3m"),
-                    raw_report.get("industryDBTLast3M")
-                )),
-                "last_6m": safe_int(get_first(
-                    get_in(payment_src, "industry_dbt", "last_6m"),
-                    get_in(payment_src, "industryDBT", "last6m"),
-                    payment_src.get("industry_dbt_last_6m"),
-                    payment_src.get("industryDBTLast6M"),
-                    raw_report.get("industry_dbt_last_6m"),
-                    raw_report.get("industryDBTLast6M")
-                )),
-                "last_12m": safe_int(get_first(
-                    get_in(payment_src, "industry_dbt", "last_12m"),
-                    get_in(payment_src, "industryDBT", "last12m"),
-                    payment_src.get("industry_dbt_last_12m"),
-                    payment_src.get("industryDBTLast12M"),
-                    raw_report.get("industry_dbt_last_12m"),
-                    raw_report.get("industryDBTLast12M")
-                )),
-            },
-            "unpaid_accounts": {
-                "one_month": safe_int(get_first(
-                    get_in(payment_src, "unpaid_accounts", "one_month"),
-                    get_in(payment_src, "unpaidAccounts", "oneMonth"),
-                    payment_src.get("unpaid_accounts_1m"),
-                    raw_report.get("unpaid_accounts_1m")
-                )),
-                "two_months": safe_int(get_first(
-                    get_in(payment_src, "unpaid_accounts", "two_months"),
-                    get_in(payment_src, "unpaidAccounts", "twoMonths"),
-                    payment_src.get("unpaid_accounts_2m"),
-                    raw_report.get("unpaid_accounts_2m")
-                )),
-                "three_plus_months": safe_int(get_first(
-                    get_in(payment_src, "unpaid_accounts", "three_plus_months"),
-                    get_in(payment_src, "unpaidAccounts", "threePlusMonths"),
-                    payment_src.get("unpaid_accounts_3m_plus"),
-                    raw_report.get("unpaid_accounts_3m_plus")
-                )),
-            },
-            "trend": get_first(payment_src.get("trend"), payment_src.get("payment_trend"), raw_report.get("payment_trend")),
-        },
-        "legal": {
-            "ccj_count_last_2y": ccj_count_last_2y,
-            "ccj_flag": (ccj_count_last_2y or 0) > 0,
-            "most_recent_legal_notices_text": get_first(
-                legal_src.get("most_recent_legal_notices_text"),
-                legal_src.get("legalNoticesText"),
-                raw_report.get("legal_notices_text"),
-                raw_report.get("legalNoticesText")
-            ),
-            "legal_notices_count": safe_int(get_first(
-                legal_src.get("legal_notices_count"),
-                legal_src.get("legalNoticesCount"),
-                raw_report.get("legal_notices_count"),
-                raw_report.get("legalNoticesCount")
-            ))
-        },
-        "alerts": {
-            "count": alerts_count,
-            "items": alerts_items if isinstance(alerts_items, list) else []
-        },
-        "financials": {
-            "currency": get_first(financials_src.get("currency"), raw_report.get("financial_currency"), "GBP"),
-            "latest_accounts_date": get_first(
-                financials_src.get("latest_accounts_date"),
-                financials_src.get("latestAccountsDate"),
-                raw_report.get("latest_accounts_date"),
-                raw_report.get("latestAccountsDate")
-            ),
-            "latest_confirmation_date": get_first(
-                financials_src.get("latest_confirmation_date"),
-                financials_src.get("latestConfirmationDate"),
-                raw_report.get("latest_confirmation_date"),
-                raw_report.get("latestConfirmationDate")
-            ),
-            "accounts_reference_date": get_first(
-                financials_src.get("accounts_reference_date"),
-                financials_src.get("accountsReferenceDate"),
-                raw_report.get("accounts_reference_date"),
-                raw_report.get("accountsReferenceDate")
-            ),
-            "summary_latest": summary_latest if isinstance(summary_latest, dict) else {},
-            "history_4y": history_4y if isinstance(history_4y, list) else [],
-            "ratios": ratios if isinstance(ratios, dict) else {},
-            "cash_flow_available": safe_bool(get_first(
-                financials_src.get("cash_flow_available"),
-                financials_src.get("cashFlowAvailable"),
-                raw_report.get("cash_flow_available"),
-                raw_report.get("cashFlowAvailable")
-            )),
-            "profit_loss_available": safe_bool(get_first(
-                financials_src.get("profit_loss_available"),
-                financials_src.get("profitLossAvailable"),
-                raw_report.get("profit_loss_available"),
-                raw_report.get("profitLossAvailable")
-            )),
-        },
-        "directors_summary": {
-            "current_directors_count": safe_int(get_first(
-                directors_src.get("current_directors_count"),
-                directors_src.get("currentDirectorsCount"),
-                raw_report.get("current_directors_count"),
-                raw_report.get("currentDirectorsCount")
-            )),
-            "current_directors_may_also_be_shareholders": safe_int(get_first(
-                directors_src.get("current_directors_may_also_be_shareholders"),
-                directors_src.get("currentDirectorsMayAlsoBeShareholders"),
-                raw_report.get("current_directors_may_also_be_shareholders"),
-                raw_report.get("currentDirectorsMayAlsoBeShareholders")
-            )),
-        },
-        "corporate_structure": {
-            "is_group_member": corporate_is_group_member,
-            "summary": get_first(
-                corporate_src.get("summary"),
-                corporate_src.get("structureSummary"),
-                corporate_src.get("parent_name"),
-                corporate_src.get("parentName"),
-                raw_report.get("corporate_structure_summary")
-            )
-        },
-        "charges_summary": {
-            "outstanding_count": safe_int(get_first(
-                charges_src.get("outstanding_count"),
-                charges_src.get("outstandingCount"),
-                raw_report.get("outstanding_charges_count"),
-                raw_report.get("outstandingChargesCount")
-            )),
-            "satisfied_count": safe_int(get_first(
-                charges_src.get("satisfied_count"),
-                charges_src.get("satisfiedCount"),
-                raw_report.get("satisfied_charges_count"),
-                raw_report.get("satisfiedChargesCount")
-            ))
-        },
-        "warnings": [],
-        "raw": raw_report,
-    }
-
-
 def empty_experian_response(source: str, company_name: Optional[str], warning: str, raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {
         "available": False,
@@ -1093,17 +659,97 @@ def get_experian_report(company_number: str, company_name: Optional[str] = None)
 
     try:
         token = experian_get_token()
-        raw_report = experian_get_company_report_live(token, company_number)
-        mapped = map_experian_live_payload(raw_report, business_id=company_number, matched_company_name=company_name)
+        search_result = experian_search_company_live(token, company_number, company_name)
 
-        if not mapped.get("matched_company_name"):
-            mapped["matched_company_name"] = company_name
-
-        mapped["raw"] = {
-            "report_result": raw_report
+        return {
+            "available": False,
+            "source": "experian_live",
+            "reference": None,
+            "report_date": now_utc_iso()[:10],
+            "matched_company_name": company_name,
+            "score": None,
+            "score_description": None,
+            "risk_band": None,
+            "credit_limit": money(None),
+            "credit_rating": money(None),
+            "ccj_count_last_2y": None,
+            "payment_behaviour": {
+                "average_dbt": None,
+                "company_payment_data_available": None,
+                "industry_dbt_current": None,
+                "ccj_count_last_2y": None,
+                "ccj_flag": False,
+                "insolvency_flag": False,
+            },
+            "opinion": {"summary": None},
+            "credit_values": {
+                "credit_limit": money(None),
+                "credit_rating": money(None),
+            },
+            "commercial_delphi": {
+                "score": None,
+                "band": None,
+                "failure_odds": None,
+                "calculated_at": None,
+                "history_12m": [],
+                "sector_comparisons": {},
+            },
+            "payment_profile": {
+                "company_payment_data_available": None,
+                "company_dbt": None,
+                "company_dbt_text": None,
+                "industry_dbt": {
+                    "current": None,
+                    "last_3m": None,
+                    "last_6m": None,
+                    "last_12m": None,
+                },
+                "unpaid_accounts": {
+                    "one_month": None,
+                    "two_months": None,
+                    "three_plus_months": None,
+                },
+                "trend": None,
+            },
+            "legal": {
+                "ccj_count_last_2y": None,
+                "ccj_flag": False,
+                "most_recent_legal_notices_text": None,
+                "legal_notices_count": None,
+            },
+            "alerts": {
+                "count": None,
+                "items": [],
+            },
+            "financials": {
+                "currency": "GBP",
+                "latest_accounts_date": None,
+                "latest_confirmation_date": None,
+                "accounts_reference_date": None,
+                "summary_latest": {},
+                "history_4y": [],
+                "ratios": {},
+                "cash_flow_available": None,
+                "profit_loss_available": None,
+            },
+            "directors_summary": {
+                "current_directors_count": None,
+                "current_directors_may_also_be_shareholders": None,
+            },
+            "corporate_structure": {
+                "is_group_member": None,
+                "summary": None,
+            },
+            "charges_summary": {
+                "outstanding_count": None,
+                "satisfied_count": None,
+            },
+            "warnings": ["DEBUG: returning raw search_result only"],
+            "raw": {
+                "search_result": search_result,
+                "extracted_business_id_guess": experian_extract_business_id(search_result),
+            },
         }
-        return mapped
-        
 
     except Exception as e:
         logger.exception("Experian fetch failed")
@@ -1737,11 +1383,8 @@ def root():
             "/rix-credit/company/{company_number}/credit-assessment"
         ],
         "notes": [
-            "OCR / PDF accounts extraction removed from live path",
-            "Experian is primary bureau layer",
+            "Experian debug build: returns raw search_result only",
             "Companies House retained for structural/context data",
-            "Experian payload upgraded with credit rating, Delphi, legal, alerts, and 4Y financials",
-            "Policy overrides applied to final stance and limit",
             "credit-assessment kept as alias to calibrated decision for compatibility"
         ]
     }
@@ -1768,6 +1411,7 @@ def debug_env():
         "experian_username_set": bool(EXPERIAN_USERNAME),
         "experian_password_set": bool(EXPERIAN_PASSWORD),
         "experian_base_url": EXPERIAN_BASE_URL,
+        "experian_search_path": EXPERIAN_SEARCH_PATH,
     }
 
 
