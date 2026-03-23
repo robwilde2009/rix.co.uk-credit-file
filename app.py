@@ -262,9 +262,13 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
-    params = {"businessref": company_number}
-    if company_name:
-        params["name"] = company_name
+    search_name = (company_name or "").strip()
+    if not search_name:
+        search_name = company_number
+
+    params = {
+        "name": search_name
+    }
 
     query = urlencode(params)
     target_url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}?{query}"
