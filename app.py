@@ -29,7 +29,7 @@ EXPERIAN_USERNAME = os.getenv("EXPERIAN_USERNAME", "").strip()
 EXPERIAN_PASSWORD = os.getenv("EXPERIAN_PASSWORD", "").strip()
 
 EXPERIAN_TOKEN_PATH = os.getenv("EXPERIAN_TOKEN_PATH", "/oauth2/v1/token").strip()
-EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/businesses/v1/search").strip()
+EXPERIAN_SEARCH_PATH = os.getenv("EXPERIAN_SEARCH_PATH", "/businessinformation/v2/businesssearch").strip()
 EXPERIAN_REPORT_PATH_TEMPLATE = os.getenv(
     "EXPERIAN_REPORT_PATH_TEMPLATE",
     "/businessinformation/businesses/v1/{business_id}/report"
