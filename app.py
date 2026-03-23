@@ -295,15 +295,23 @@ def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str
     return None
 
 
+from urllib.parse import quote
+
 def experian_get_company_report_live(token: str, company_number: str) -> Dict[str, Any]:
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit"
+    target_url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit/{company_number}"
+
+    url = f"https://sandbox-us-api.experian.com/eits/gdp/v1/request"
 
     params = {
-        "regNumber": company_number
+        "targeturl": target_url
     }
 
-    with experian_session(token) as s:
-        r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=EXPERIAN_TIMEOUT)
 
     if not r.ok:
         raise HTTPException(502, f"Experian report error: {r.status_code} {r.text[:500]}")
