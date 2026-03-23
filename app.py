@@ -250,13 +250,14 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
-
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesssearch"
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
 
     params = {
-        "name": company_name or "",
         "businessref": company_number,
     }
+
+    if company_name:
+        params["name"] = company_name
 
     with experian_session(token) as s:
         r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
