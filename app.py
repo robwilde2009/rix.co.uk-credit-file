@@ -619,6 +619,7 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
+
     url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesstargeter"
 
     params = {
@@ -626,7 +627,7 @@ def experian_search_company_live(
     }
 
     if company_name:
-        params["businessname"] = company_name
+        params["name"] = company_name  # ✅ correct field
 
     headers = {
         "Accept": "application/json",
