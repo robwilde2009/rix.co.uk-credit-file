@@ -24,7 +24,7 @@ CH_API_BASE = "https://api.company-information.service.gov.uk"
 EXPERIAN_MODE = os.getenv("EXPERIAN_MODE", "mock").strip().lower()  # mock | live
 EXPERIAN_BASE_URL = os.getenv(
     "EXPERIAN_BASE_URL",
-    "https://sandbox-uk-api.experian.com"
+    "https://sandbox-uk-api.experian.com/risk/business"
 ).strip()
 EXPERIAN_CLIENT_ID = os.getenv("EXPERIAN_CLIENT_ID", "").strip()
 EXPERIAN_CLIENT_SECRET = os.getenv("EXPERIAN_CLIENT_SECRET", "").strip()
@@ -296,10 +296,14 @@ def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str
 
 
 def experian_get_company_report_live(token: str, company_number: str) -> Dict[str, Any]:
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit/{company_number}"
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/registeredcompanycredit"
+
+    params = {
+        "regNumber": company_number
+    }
 
     with experian_session(token) as s:
-        r = s.get(url, timeout=EXPERIAN_TIMEOUT)
+        r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
 
     if not r.ok:
         raise HTTPException(502, f"Experian report error: {r.status_code} {r.text[:500]}")
