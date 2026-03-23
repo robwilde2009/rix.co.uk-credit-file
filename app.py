@@ -614,6 +614,32 @@ def empty_experian_response(source: str, company_name: Optional[str], warning: s
         "raw": raw,
     }
 
+def experian_search_company_live(
+    token: str,
+    company_number: str,
+    company_name: Optional[str] = None
+) -> Dict[str, Any]:
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesstargeter"
+
+    params = {
+        "businessref": company_number
+    }
+
+    if company_name:
+        params["businessname"] = company_name
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": f"rix-credit-api/{APP_VERSION}",
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=EXPERIAN_TIMEOUT)
+
+    if not r.ok:
+        raise HTTPException(502, f"Experian search error: {r.status_code} {r.text[:500]}")
+
+    return r.json()
 
 def get_experian_report(company_number: str, company_name: Optional[str] = None) -> Dict[str, Any]:
     if EXPERIAN_MODE == "mock":
