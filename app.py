@@ -254,8 +254,7 @@ def experian_search_company_live(
     url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesssearch"
 
     params = {
-        "registrationNumber": company_number,
-        "country": "GBR"
+        "businessref": company_number,
     }
 
     with experian_session(token) as s:
