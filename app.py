@@ -200,7 +200,48 @@ def experian_session(token: Optional[str] = None) -> requests.Session:
     return s
 
 
-def experian_get_token() -> str:
+def experian_get_token():
+    if not EXPERIAN_CLIENT_ID or not EXPERIAN_CLIENT_SECRET:
+        raise HTTPException(500, "Missing Experian client credentials")
+
+    if not EXPERIAN_USERNAME or not EXPERIAN_PASSWORD:
+        raise HTTPException(500, "Missing Experian username/password")
+
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_TOKEN_PATH}"
+
+    payload = {
+        "username": EXPERIAN_USERNAME,
+        "password": EXPERIAN_PASSWORD,
+        "client_id": EXPERIAN_CLIENT_ID,
+        "client_secret": EXPERIAN_CLIENT_SECRET,
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Grant_type": "password",
+        "User-Agent": f"rix-credit-api/{APP_VERSION}",
+    }
+
+    # 🔴 THIS IS THE KEY FIX
+    r = requests.post(url, json=payload, headers=headers, timeout=EXPERIAN_TIMEOUT)
+
+    if not r.ok:
+        raise HTTPException(
+            502,
+            f"Experian token error: {r.status_code} {r.text[:500]}"
+        )
+
+    data = r.json()
+    token = data.get("access_token")
+
+    if not token:
+        raise HTTPException(
+            502,
+            f"Experian token response missing access_token: {data}"
+        )
+
+    return token -> str:
     if not EXPERIAN_CLIENT_ID or not EXPERIAN_CLIENT_SECRET:
         raise HTTPException(500, "Experian credentials missing")
 
