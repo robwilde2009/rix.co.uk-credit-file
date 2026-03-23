@@ -253,11 +253,10 @@ def experian_search_company_live(
     url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
 
     payload = {
+        "searchType": "business",
         "registrationNumber": company_number,
-        "country": "GB",
+        "country": "GBR"
     }
-    if company_name:
-        payload["name"] = company_name
 
     with experian_session(token) as s:
         r = s.post(url, json=payload, timeout=EXPERIAN_TIMEOUT)
