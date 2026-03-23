@@ -12,7 +12,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("rix-credit-api")
 
 APP_NAME = "Rix Credit API"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 
 # -----------------------------------------------------------------------------
 # Environment / Config
@@ -387,11 +387,14 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
         "gearing_pct": 137.97
     }
 
+    matched_name = company_name or f"Mock match for {company_number}"
+
     return {
         "available": True,
         "source": "experian_mock",
         "reference": f"EXP-{company_number}",
-        "matched_company_name": company_name,
+        "report_date": now_utc_iso()[:10],
+        "matched_company_name": matched_name,
 
         # shortcut fields for simple scoring logic
         "score": delphi_score,
@@ -399,6 +402,7 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
         "risk_band": delphi_band,
         "credit_limit": money(credit_limit_value),
         "credit_rating": money(credit_rating_value),
+        "ccj_count_last_2y": ccj_count,
         "payment_behaviour": {
             "average_dbt": company_dbt,
             "company_payment_data_available": company_payment_data_available,
@@ -408,9 +412,9 @@ def experian_mock_report(company_number: str, company_name: Optional[str] = None
             "insolvency_flag": False,
         },
 
-        # richer report structure
+        # richer structure
         "opinion": {
-            "summary": "A low risk company; credit may be considered within the recommended limit."
+            "summary": "A very low risk company; credit may be considered comfortably within the recommended rating and with caution around structural encumbrances."
         },
 
         "credit_values": {
@@ -548,7 +552,6 @@ def map_experian_live_payload(
     response fields are confirmed.
     """
 
-    # top-level and nested candidate sources
     delphi_src = get_first(
         raw_report.get("commercial_delphi"),
         raw_report.get("commercialDelphi"),
@@ -758,11 +761,20 @@ def map_experian_live_payload(
         )
     )
 
+    effective_matched_name = get_first(
+        matched_company_name,
+        raw_report.get("matched_company_name"),
+        raw_report.get("matchedCompanyName"),
+        get_in(raw_report, "business", "name"),
+        get_in(raw_report, "company", "name"),
+    )
+
     return {
         "available": True,
         "source": "experian_live",
         "reference": get_first(raw_report.get("reference"), raw_report.get("reportId"), business_id),
-        "matched_company_name": matched_company_name,
+        "report_date": get_first(raw_report.get("report_date"), raw_report.get("reportDate"), now_utc_iso()[:10]),
+        "matched_company_name": effective_matched_name,
 
         # simple top-level shortcuts
         "score": delphi_score,
@@ -770,6 +782,7 @@ def map_experian_live_payload(
         "risk_band": delphi_band,
         "credit_limit": money(credit_limit_value),
         "credit_rating": money(credit_rating_value),
+        "ccj_count_last_2y": ccj_count_last_2y,
         "payment_behaviour": {
             "average_dbt": company_dbt,
             "company_payment_data_available": company_payment_data_available,
@@ -989,12 +1002,14 @@ def empty_experian_response(source: str, company_name: Optional[str], warning: s
         "available": False,
         "source": source,
         "reference": None,
+        "report_date": now_utc_iso()[:10],
         "matched_company_name": company_name,
         "score": None,
         "score_description": None,
         "risk_band": None,
         "credit_limit": money(None),
         "credit_rating": money(None),
+        "ccj_count_last_2y": None,
         "payment_behaviour": {
             "average_dbt": None,
             "company_payment_data_available": None,
@@ -1090,11 +1105,14 @@ def get_experian_report(company_number: str, company_name: Optional[str] = None)
 
         raw_report = experian_get_company_report_live(token, business_id)
         mapped = map_experian_live_payload(raw_report, business_id=business_id, matched_company_name=company_name)
-        if "search_result" not in mapped["raw"]:
-            mapped["raw"] = {
-                "search_result": search_result,
-                "report_result": raw_report
-            }
+
+        if not mapped.get("matched_company_name"):
+            mapped["matched_company_name"] = company_name
+
+        mapped["raw"] = {
+            "search_result": search_result,
+            "report_result": raw_report
+        }
         return mapped
 
     except Exception as e:
@@ -1121,7 +1139,6 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
     charges = companies_house.get("charges") or []
     profile = companies_house.get("company_profile") or {}
 
-    # Prefer 4Y latest financial history if present, otherwise summary
     financials = experian.get("financials") or {}
     history_4y = financials.get("history_4y") or []
     latest_hist = history_4y[0] if isinstance(history_4y, list) and history_4y else {}
@@ -1255,19 +1272,19 @@ def build_internal_model(companies_house: Dict[str, Any], experian: Dict[str, An
     if score >= 85:
         grade = "A"
         risk_label = "Low"
-        limit = credit_limit_value or 50000
+        limit = credit_limit_value or credit_rating_value or 50000.0
     elif score >= 70:
         grade = "B"
         risk_label = "Low to Moderate"
-        limit = min(credit_limit_value or 25000, max(25000.0, credit_rating_value or 25000.0))
+        limit = credit_rating_value or 25000.0
     elif score >= 55:
         grade = "C"
         risk_label = "Moderate"
-        limit = min(credit_limit_value or 12000, max(12000.0, credit_rating_value or 12000.0))
+        limit = min(credit_rating_value or 12000.0, credit_limit_value or 12000.0)
     elif score >= 40:
         grade = "D"
         risk_label = "Moderate to High"
-        limit = min(credit_limit_value or 5000, 5000.0)
+        limit = min(credit_rating_value or 5000.0, 5000.0)
     else:
         grade = "E"
         risk_label = "High"
@@ -1402,6 +1419,7 @@ def build_final_decision(
     exp_credit_rating = safe_float(get_in(experian, "credit_rating", "amount")) or 0.0
     outstanding_charges = safe_int(get_in(experian, "charges_summary", "outstanding_count")) or 0
     delphi_band = get_in(experian, "commercial_delphi", "band")
+    charge_caution = outstanding_charges > 0
 
     # Hard stop: insolvency
     if payment.get("insolvency_flag"):
@@ -1467,45 +1485,87 @@ def build_final_decision(
         warnings.append(f"{alerts_count} bureau alert(s) present")
         rationale.append("Bureau alerts should be considered alongside the financial stance")
 
+    if safe_bool(payment.get("company_payment_data_available")) is False:
+        warnings.append("No company payment data available")
+        rationale.append("No company payment data is available, so limit confidence is reduced")
+
     if delphi_band:
         rationale.append(f"Delphi band: {delphi_band}")
+
+    bias = calibration.get("decision_bias")
 
     if final_score >= 85:
         risk_rating = "Low"
         credit_stance = "Approve"
-        suggested_limit = max(exp_credit_limit, exp_credit_rating)
-        confidence = "high" if experian.get("available") else "medium"
+        if bias == "conservative_middle":
+            suggested_limit = min(
+                exp_credit_limit or exp_credit_rating or 50000.0,
+                max(exp_credit_rating or 0.0, round((exp_credit_limit + exp_credit_rating) / 2)) if exp_credit_limit and exp_credit_rating else (exp_credit_rating or exp_credit_limit or 50000.0)
+            )
+            confidence = "medium"
+        else:
+            suggested_limit = max(exp_credit_limit, exp_credit_rating, 0.0)
+            confidence = "high" if experian.get("available") else "medium"
+
     elif final_score >= 70:
         risk_rating = "Low to Moderate"
         credit_stance = "Approve with normal controls"
-        suggested_limit = min(exp_credit_limit or 25000.0, max(exp_credit_rating or 25000.0, 25000.0)) if experian.get("available") else 25000.0
+        if exp_credit_limit > 0 and exp_credit_rating > 0:
+            suggested_limit = min(
+                exp_credit_limit,
+                max(exp_credit_rating, round((exp_credit_limit + exp_credit_rating) / 2))
+            )
+        else:
+            suggested_limit = exp_credit_rating or exp_credit_limit or 25000.0
         confidence = "medium"
+
     elif final_score >= 55:
         risk_rating = "Moderate"
         credit_stance = "Approve with caution"
         if exp_credit_limit > 0 and exp_credit_rating > 0:
-            suggested_limit = min(exp_credit_limit, max(exp_credit_rating, 10000.0))
+            suggested_limit = min(
+                exp_credit_limit,
+                max(exp_credit_rating, round((exp_credit_limit + exp_credit_rating) / 2))
+            )
         else:
-            suggested_limit = 10000.0
+            suggested_limit = exp_credit_rating or exp_credit_limit or 10000.0
         confidence = "medium"
+
     elif final_score >= 40:
         risk_rating = "Moderate to High"
         credit_stance = "Restricted terms / reduced limit"
-        if exp_credit_rating > 0:
-            suggested_limit = min(5000.0, exp_credit_rating)
-        else:
-            suggested_limit = 5000.0
+        suggested_limit = min(
+            5000.0,
+            exp_credit_rating or 5000.0
+        )
         confidence = "low"
+
     else:
         risk_rating = "High"
         credit_stance = "Decline or cash-with-order"
         suggested_limit = 0.0
         confidence = "low"
 
+    # Post-adjustments for structural caution
+    if charge_caution and credit_stance == "Approve":
+        credit_stance = "Approve with normal controls"
+        confidence = "medium"
+
+    if safe_bool(payment.get("company_payment_data_available")) is False and confidence == "high":
+        confidence = "medium"
+
+    # Keep limit anchored to credit rating where caution exists
+    if bias == "conservative_middle":
+        if exp_credit_rating > 0:
+            suggested_limit = min(float(suggested_limit), max(exp_credit_rating, float(suggested_limit)))
+            # stronger cap when there is structural caution
+            if charge_caution or safe_bool(payment.get("company_payment_data_available")) is False:
+                suggested_limit = min(float(suggested_limit), max(exp_credit_rating, round((exp_credit_limit + exp_credit_rating) / 2)) if exp_credit_limit > 0 else exp_credit_rating)
+
     return {
         "risk_rating": risk_rating,
         "credit_stance": credit_stance,
-        "suggested_limit": money(suggested_limit),
+        "suggested_limit": money(float(suggested_limit)),
         "confidence": confidence,
         "rationale": rationale,
         "warnings": warnings,
