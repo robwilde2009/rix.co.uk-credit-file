@@ -212,7 +212,7 @@ def experian_get_token() -> str:
     if not EXPERIAN_USERNAME or not EXPERIAN_PASSWORD:
         raise HTTPException(500, "Missing Experian username/password")
 
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_TOKEN_PATH}"
+    url = f"https://sandbox-uk-api.experian.com{EXPERIAN_TOKEN_PATH}"
 
     payload = {
         "username": EXPERIAN_USERNAME,
