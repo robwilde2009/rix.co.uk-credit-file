@@ -257,73 +257,31 @@ def experian_proxy_get(token: str, target_url: str) -> Dict[str, Any]:
     return r.json()
 
 
-def experian_search_company_live(
-    token: str,
-    company_number: str,
-    company_name: Optional[str] = None
-) -> Dict[str, Any]:
-    search_name = (company_name or "").strip()
-    if not search_name:
-        search_name = company_number
+def experian_get_company_report_live(token: str, company_number: str) -> Dict[str, Any]:
+    # Direct UK registered company endpoint (NO SEARCH STEP)
+    target_url = f"https://sandbox-uk-api.experian.com/risk/business/v2/registeredcompanycredit/{company_number}"
+
+    # GDP proxy (REQUIRED)
+    url = "https://sandbox-us-api.experian.com/eits/gdp/v1/request"
 
     params = {
-        "name": search_name
+        "targeturl": target_url
     }
 
-    query = urlencode(params)
-    target_url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}?{query}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
 
-    return experian_proxy_get(token, target_url)
+    r = requests.get(url, params=params, headers=headers, timeout=EXPERIAN_TIMEOUT)
 
+    if not r.ok:
+        raise HTTPException(
+            502,
+            f"Experian report error: {r.status_code} {r.text[:500]}"
+        )
 
-def experian_extract_business_id(search_payload: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(search_payload, dict):
-        return None
-
-    candidate_lists = [
-        search_payload.get("results"),
-        search_payload.get("businesses"),
-        search_payload.get("items"),
-        search_payload.get("data"),
-        search_payload.get("searchResults"),
-    ]
-
-    for candidate_list in candidate_lists:
-        if isinstance(candidate_list, list) and candidate_list:
-            first = candidate_list[0]
-            if isinstance(first, dict):
-                for key in [
-                    "businessId",
-                    "business_id",
-                    "id",
-                    "companyId",
-                    "company_id",
-                    "reference",
-                    "businessRef",
-                    "businessref",
-                    "regNumber",
-                    "regnumber",
-                ]:
-                    if first.get(key):
-                        return str(first.get(key))
-
-    for key in [
-        "businessId",
-        "business_id",
-        "id",
-        "companyId",
-        "company_id",
-        "reference",
-        "businessRef",
-        "businessref",
-        "regNumber",
-        "regnumber",
-    ]:
-        if search_payload.get(key):
-            return str(search_payload.get(key))
-
-    return None
-
+    return r.json()
 
 def experian_mock_report(company_number: str, company_name: Optional[str] = None) -> Dict[str, Any]:
     seed = sum(ord(c) for c in company_number) % 25
@@ -751,7 +709,7 @@ def get_experian_report(company_number: str, company_name: Optional[str] = None)
             "warnings": ["DEBUG: returning raw search_result only"],
             "raw": {
                 "search_result": search_result,
-                "extracted_business_id_guess": experian_extract_business_id(search_result),
+                "extracted_business_id_guess": None,
             },
         }
 
