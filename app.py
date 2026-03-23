@@ -250,16 +250,16 @@ def experian_search_company_live(
     company_number: str,
     company_name: Optional[str] = None
 ) -> Dict[str, Any]:
-    url = f"{EXPERIAN_BASE_URL.rstrip('/')}{EXPERIAN_SEARCH_PATH}"
 
-    payload = {
-        "searchType": "business",
+    url = f"{EXPERIAN_BASE_URL.rstrip('/')}/v2/businesssearch"
+
+    params = {
         "registrationNumber": company_number,
         "country": "GBR"
     }
 
     with experian_session(token) as s:
-        r = s.post(url, json=payload, timeout=EXPERIAN_TIMEOUT)
+        r = s.get(url, params=params, timeout=EXPERIAN_TIMEOUT)
 
     if not r.ok:
         raise HTTPException(502, f"Experian search error: {r.status_code} {r.text[:500]}")
